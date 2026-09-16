@@ -1,4 +1,5 @@
 import chalk from "chalk";
+import stripAnsi from "strip-ansi";
 import type { SessionUsageSummary } from "../core/usage.js";
 import { classifySessionRosterStatus } from "../modes/daemon/agent-roster.js";
 import { formatSessionDisplayId } from "../modes/daemon/daemon-session-id.js";
@@ -7,6 +8,9 @@ import { formatSessionAge, formatTable } from "./daemon-list-format.js";
 
 // Cap for free-text cells (recaps, diagnostics) so one long line never stretches the row.
 const MAX_CELL_CHARS = 60;
+
+// Controls that stripAnsi misses and compactCellText would not compact away.
+const CONTROL_CHARACTERS = /[\u0000-\u0008\u000E-\u001F\u007F-\u009F]/g;
 
 type SessionsRow = {
 	name: string;
@@ -26,7 +30,7 @@ type SessionsRow = {
  */
 export function formatSessionsTable(sessions: readonly SessionSummary[], nowMs = Date.now()): string {
 	const rows = sortSessionsForTable(sessions).map((summary) => ({
-		name: summary.sessionName ?? formatSessionDisplayId(summary.id),
+		name: sessionNameCell(summary),
 		status: sessionsStatusLabel(summary),
 		activity: truncateCell(sessionActivityCell(summary)),
 		"last heard": formatSessionAge(summary.lastHeardFromAt ?? summary.modified, nowMs),
@@ -147,6 +151,13 @@ function formatTokenCount(tokens: number): string {
 		return `${(tokens / 1_000_000).toFixed(1)}m`;
 	}
 	return `${(tokens / 1_000_000_000).toFixed(1)}b`;
+}
+
+// Names are user-provided: strip ANSI escapes and control characters, then
+// compact whitespace, so the cell can never add table lines or move the cursor.
+function sessionNameCell(summary: SessionSummary): string {
+	const raw = summary.sessionName ?? formatSessionDisplayId(summary.id);
+	return compactCellText(stripAnsi(raw).replace(CONTROL_CHARACTERS, ""));
 }
 
 function compactCellText(value: string | undefined): string {

@@ -260,6 +260,48 @@ describe("formatSessionsTable", () => {
 		);
 	});
 
+	it("compacts whitespace in session names so each row stays on one line", () => {
+		expectTable(
+			[
+				makeSummary({
+					id: "newline-agent",
+					activeSessionId: "active-newline",
+					activity: "idle",
+					sessionName: "sneaky\nagent",
+				}),
+			],
+			[["sneaky agent", "idle", "", "2h", "", ""]],
+		);
+	});
+
+	it("strips terminal escape sequences from session names", () => {
+		expectTable(
+			[
+				makeSummary({
+					id: "ansi-agent",
+					activeSessionId: "active-ansi",
+					activity: "idle",
+					sessionName: "\u001B[31mansi\u001B[39m agent",
+				}),
+			],
+			[["ansi agent", "idle", "", "2h", "", ""]],
+		);
+	});
+
+	it("strips control characters from session names", () => {
+		expectTable(
+			[
+				makeSummary({
+					id: "control-agent",
+					activeSessionId: "active-control",
+					activity: "idle",
+					sessionName: "beep\u0007 agent",
+				}),
+			],
+			[["beep agent", "idle", "", "2h", "", ""]],
+		);
+	});
+
 	it("renders a heartbeating idle agent with its registered heartbeat", () => {
 		expectTable(
 			[
@@ -370,6 +412,7 @@ interface SummaryOptions {
 	sessionActions?: SessionSummary["sessionActions"];
 	runtimeKind?: SessionSummary["runtimeKind"];
 	repliedSinceTask?: boolean;
+	sessionName?: string;
 	unnamed?: boolean;
 }
 
@@ -381,7 +424,7 @@ function makeSummary(options: SummaryOptions): SessionSummary {
 		isSessionActive: options.activity === "working",
 		...(options.activeSessionId ? { activeSessionId: options.activeSessionId } : {}),
 		sessionId: `session-${options.id}`,
-		...(options.unnamed ? {} : { sessionName: options.id }),
+		...(options.unnamed ? {} : { sessionName: options.sessionName ?? options.id }),
 		cwd: "/tmp/project",
 		isStreaming: options.streaming ?? false,
 		isCompacting: options.compacting ?? false,
