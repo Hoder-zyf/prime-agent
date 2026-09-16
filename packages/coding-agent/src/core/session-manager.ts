@@ -1459,14 +1459,11 @@ export class SessionManager {
 	private labelsById: Map<string, string> = new Map();
 	private labelTimestampsById: Map<string, string> = new Map();
 	private leafId: string | null = null;
-	// Cache of the live leaf's branch path (getBranch() reads for this.leafId).
-	// The per-turn compaction check and the context-usage state build re-read the
-	// branch on every assistant message end, and each read walked leaf-to-root
-	// and allocated a fresh array. This cache turns those reads into an O(1)
-	// lookup of an array that appends extend in place. Every other leafId write
-	// (branch, resetLeaf, branchWithSummary, rollback, session load/rebuild)
-	// drops it. The cached array is handed out as-is, so callers must treat it
-	// as read-only and must not hold it across an append.
+	// Cache of the live leaf's branch path, so the per-turn compaction check and the
+	// context-usage state build get an O(1) lookup instead of a leaf-to-root walk.
+	// Appends extend the cached array in place; every other leafId write drops the
+	// cache. The array is handed out as-is, so callers must treat it as read-only
+	// and must not hold it across an append.
 	private leafBranchCache: { leafId: string | null; entries: SessionEntry[] } | null = null;
 	private persistListeners = new Set<SessionPersistListener>();
 
@@ -1759,14 +1756,14 @@ export class SessionManager {
 		}
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
-		this._extendLeafBranchCache(entry);
 		this._persist(entry);
+		// After _persist: a throwing persist rolls the append back, and the cache must
+		// not grow past a leaf that never survived it.
+		this._extendLeafBranchCache(entry);
 	}
 
-	// Appends only ever extend the live branch path, so the leaf branch cache
-	// can grow in place instead of being rebuilt on the next getBranch().
-	// Anything other than a straight append off the cached leaf drops the
-	// cache; the next getBranch() rebuilds it lazily.
+	// Appends only ever extend the live branch path, so the leaf branch cache grows
+	// in place. Anything other than a straight append off the cached leaf drops it.
 	private _extendLeafBranchCache(entry: SessionEntry): void {
 		const cache = this.leafBranchCache;
 		if (cache && cache.leafId === entry.parentId) {
@@ -2074,9 +2071,16 @@ export class SessionManager {
 		} catch (error) {
 			// The append indexes the entry before persisting it; undo exactly that.
 			if (this.leafId !== null && this.leafId !== previousLeafId) {
-				this.byId.delete(this.leafId);
+				const rolledBackId = this.leafId;
+				this.byId.delete(rolledBackId);
 				this.fileEntries.pop();
 				this._refreshHasAssistantEntry();
+				// A cache extended by the append is live, so drop the rolled-back entry from
+				// the array a caller may already hold before invalidating the cache.
+				const cache = this.leafBranchCache;
+				if (cache && cache.entries[cache.entries.length - 1]?.id === rolledBackId) {
+					cache.entries.pop();
+				}
 				this.leafId = previousLeafId;
 				this.leafBranchCache = null;
 				// The failed append may have left a torn line on disk. Restore the file
@@ -2142,13 +2146,14 @@ export class SessionManager {
 		return entry.id;
 	}
 
+	/**
+	 * Entries on the active branch, root to leaf. A leaf read returns the live
+	 * leaf-branch cache: treat the result as read-only and do not hold it across
+	 * appends.
+	 */
 	getBranch(fromId?: string): SessionEntry[] {
-		// The live leaf path is read on every assistant message end (compaction
-		// checks) and every state build (context usage), so serve it from the leaf
-		// branch cache. Reads for another entry stay uncached: those are cold
-		// navigation reads, except fromId === leafId, which is the same path.
-		// The cached array is the live one, so callers must treat the result as
-		// read-only (and must not keep it while appending).
+		// Leaf-path reads are the per-turn hot path (compaction checks, context
+		// usage); a read for another entry walks the chain instead.
 		const isLeafPath = fromId === undefined || fromId === this.leafId;
 		if (isLeafPath && this.leafBranchCache?.leafId === this.leafId) {
 			return this.leafBranchCache.entries;

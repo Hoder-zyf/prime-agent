@@ -8473,9 +8473,8 @@ export class AgentSession {
 				const result = (await this._extensionRunner.emit({
 					type: "session_before_compact",
 					preparation,
-					// slice: getBranch() returns the live leaf-branch cache, which
-					// appends extend in place. Extensions got a private snapshot
-					// before, so keep that contract across the awaited handler.
+					// slice: getBranch() returns the live leaf-branch cache, which appends
+					// extend in place, so the awaited handler gets a snapshot.
 					branchEntries: pathEntries.slice(),
 					customInstructions,
 					signal,

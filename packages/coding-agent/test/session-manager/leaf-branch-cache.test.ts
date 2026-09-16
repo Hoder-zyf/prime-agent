@@ -57,8 +57,11 @@ describe("SessionManager leaf branch cache", () => {
 		const secondId = session.appendMessage(assistantMsg("two"));
 		expect(ids(session)).toEqual([firstId, secondId]); // populates the cache
 
+		const before = session.getBranch();
 		const thirdId = session.appendCustomMessageEntry("note", "hello", false);
 		expectChainMatches(session, [firstId, secondId, thirdId]);
+		// An append extends the same array the earlier read handed out.
+		expect(session.getBranch()).toBe(before);
 
 		const fourthId = session.appendMessage(userMsg("four"));
 		expectChainMatches(session, [firstId, secondId, thirdId, fourthId]);
@@ -173,6 +176,39 @@ describe("SessionManager leaf branch cache", () => {
 				.getBranch()
 				.map((entry) => entry.id),
 		).toEqual(session.getBranch().map((entry) => entry.id));
+	});
+
+	it("never leaves a rolled-back append in a branch array a caller already holds", () => {
+		const dir = createTempDir();
+		const session = SessionManager.create(dir, join(dir, "sessions"));
+		const firstId = session.appendMessage(userMsg("one"));
+		const held = session.getBranch(); // the live cached array
+
+		// The append persists, so it reaches the cached array in place...
+		vi.spyOn(session, "flushNow").mockImplementationOnce(() => {
+			throw new Error("flush failed");
+		});
+		expect(() => session.appendCustomMessageEntryWithRollback("note", "unsaved", false)).toThrow("flush failed");
+
+		// ...and the rollback takes it back out of that same array.
+		expect(held.map((entry) => entry.id)).toEqual([firstId]);
+		expect(session.getLeafId()).toBe(firstId);
+		expectChainMatches(session, [firstId]);
+
+		// A failing persist never extends the cache in the first place.
+		const heldAgain = session.getBranch();
+		vi.spyOn(session, "_persist").mockImplementationOnce(() => {
+			throw new Error("disk full");
+		});
+		expect(() => session.appendCustomMessageEntryWithRollback("note", "unsaved again", false)).toThrow("disk full");
+
+		expect(heldAgain.map((entry) => entry.id)).toEqual([firstId]);
+		expect(session.getLeafId()).toBe(firstId);
+		expectChainMatches(session, [firstId]);
+
+		// The next append starts from the rolled-back leaf and stays coherent.
+		const secondId = session.appendCustomMessageEntry("note", "saved", false);
+		expectChainMatches(session, [firstId, secondId]);
 	});
 
 	it("keeps the cached branch identical to a reopened session's branch", () => {
