@@ -316,6 +316,61 @@ describe("daemon command", () => {
 		]);
 	});
 
+	it("prints the sessions operator table from the list rpc", async () => {
+		daemonClientMock.behavior.sessions = [makeSessionSummary("active-1", "session-1", "alpha")];
+		const logCalls: string[] = [];
+		vi.spyOn(console, "log").mockImplementation((...messages: unknown[]) => {
+			logCalls.push(messages.map(String).join(" "));
+		});
+
+		await expect(handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "sessions"])).resolves.toBe(
+			true,
+		);
+
+		expect(daemonClientMock.instances[0]?.requests).toEqual([{ type: "list", all: false }]);
+		expect(logCalls[0]).toContain("name");
+		expect(logCalls[0]).toContain("status");
+		expect(logCalls[0]).toContain("alpha");
+	});
+
+	it("passes --all to the sessions list rpc and dumps raw summaries with --json", async () => {
+		daemonClientMock.behavior.sessions = [makeSessionSummary("active-1", "session-1", "alpha")];
+		const logCalls: string[] = [];
+		vi.spyOn(console, "log").mockImplementation((...messages: unknown[]) => {
+			logCalls.push(messages.map(String).join(" "));
+		});
+
+		await expect(
+			handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "--json", "sessions", "--all"]),
+		).resolves.toBe(true);
+
+		expect(daemonClientMock.instances[0]?.requests).toEqual([{ type: "list", all: true }]);
+		expect(JSON.parse(logCalls[0]!)).toEqual({
+			sessions: [makeSessionSummary("active-1", "session-1", "alpha")],
+		});
+	});
+
+	it("reports an empty sessions roster without a table", async () => {
+		const logCalls: string[] = [];
+		vi.spyOn(console, "log").mockImplementation((...messages: unknown[]) => {
+			logCalls.push(messages.map(String).join(" "));
+		});
+
+		await expect(handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "sessions"])).resolves.toBe(
+			true,
+		);
+
+		expect(logCalls).toEqual(["No active agents."]);
+	});
+
+	it("rejects unknown sessions options", async () => {
+		await handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "sessions", "--bogus"]);
+		expect(process.exitCode).toBe(1);
+		expect(
+			consoleErrorMessages.some((m) => typeof m === "string" && m.includes("Unknown sessions option: --bogus")),
+		).toBe(true);
+	});
+
 	it("does not leak --goal/--goal-token-budget into daemon startup args", async () => {
 		// Force canConnectToDaemon to fail so runStart is exercised.
 		daemonClientMock.behavior.connectFails = true;
