@@ -23,10 +23,6 @@ type SessionsRow = {
 
 /**
  * One-line-per-agent operator table for `prime-agent sessions`.
- *
- * Pure client-side formatting over the daemon's existing list summaries: no new
- * protocol commands, no new daemon state. Cells that have nothing honest to
- * report stay empty.
  */
 export function formatSessionsTable(sessions: readonly SessionSummary[], nowMs = Date.now()): string {
 	const rows = sortSessionsForTable(sessions).map((summary) => ({
@@ -117,8 +113,6 @@ function sessionActivityCell(summary: SessionSummary): string {
 	return [detail, recap].filter((part) => part.length > 0).join(" · ");
 }
 
-// Last error, derived only from fields the daemon already populates: the latest
-// error diagnostic wins, then a failed worker mark, then the model fallback notice.
 function sessionErrorCell(summary: SessionSummary): string {
 	const diagnostics = summary.diagnostics ?? [];
 	for (let index = diagnostics.length - 1; index >= 0; index--) {

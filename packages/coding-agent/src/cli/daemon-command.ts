@@ -784,11 +784,7 @@ function parseListArgs(args: string[]): { all: boolean } {
 	return { all };
 }
 
-/**
- * `prime-agent sessions`: the same list RPC as `prime-agent list`, rendered as a
- * one-line-per-agent operator table (status, activity, staleness, last error,
- * usage). Pure client-side formatting; `list` keeps its compact table.
- */
+// The same list RPC as `prime-agent list`, rendered as a one-line-per-agent table.
 async function runSessions(client: DaemonClient, args: string[], json: boolean): Promise<void> {
 	const { all } = parseSessionsArgs(args);
 	const response = await client.request({ type: "list", all });
