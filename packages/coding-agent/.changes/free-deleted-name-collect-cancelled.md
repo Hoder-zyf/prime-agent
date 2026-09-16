@@ -1,0 +1,2 @@
+- Fixed `rlm.delete_subagent` holding a deleted child's session name until its background unwind finished: the name now frees at the delete receipt, so a replacement child can be spawned immediately under the same name.
+- Fixed `rlm.collect` throwing `No direct RLM child matches` when a requested target was deleted moments earlier: collect now returns a settled `cancelled` envelope for just-deleted targets immediately, without spending the timeout budget.

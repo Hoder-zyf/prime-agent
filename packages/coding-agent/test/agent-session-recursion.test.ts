@@ -4524,6 +4524,48 @@ describe("AgentSession rlm recursion", () => {
 		releaseChild();
 	});
 
+	it("frees a deleted running child's name at the delete receipt", async () => {
+		const releases: Array<() => void> = [];
+		const startedPrompts = new Set<string>();
+		const root = createSession({
+			streamFn: (_model, context) => {
+				const text = userText(context);
+				const stream = createAssistantMessageEventStream();
+				startedPrompts.add(text);
+				// The root answers its children's terminal notices immediately; only the
+				// gated child shards need explicit release, so a notice turn can never
+				// wedge quiescence behind a gate nobody releases.
+				const release = new Promise<void>((resolve) => {
+					if (text.startsWith("[child-exited:")) resolve();
+					else releases.push(resolve);
+				});
+				void release.then(() => {
+					stream.push({ type: "done", reason: "stop", message: assistantMessage(`child answer: ${text}`) });
+				});
+				return stream;
+			},
+		});
+
+		const first = await root.runRlmChild("first shard", { name: "reusable-worker" });
+		await waitFor(() => startedPrompts.has("first shard"));
+		await expect(root.deleteRlmSubagent("reusable-worker")).resolves.toMatchObject({
+			subagent: { rlm_child_id: first.rlm_child_id },
+		});
+
+		// The delete receipt returned while the aborted run still unwinds with its
+		// session bound. The name must free at the receipt, so the immediate
+		// respawn is admitted instead of failing the name-conflict check.
+		const replacement = await root.runRlmChild("replacement shard", { name: "reusable-worker" });
+		expect(replacement.name).toBe("reusable-worker");
+		expect(replacement.rlm_child_id).not.toBe(first.rlm_child_id);
+		expect((await root.listRlmSubagents()).subagents.map((entry) => entry.session_name)).toEqual(["reusable-worker"]);
+
+		await waitFor(() => startedPrompts.has("replacement shard"));
+		for (const release of releases) release();
+		await root.waitForRlmQuiescence(AbortSignal.timeout(10_000));
+		expect((await root.listRlmSubagents()).subagents.map((entry) => entry.session_name)).toEqual(["reusable-worker"]);
+	});
+
 	it("deletes an inactive nested RLM child through the root session", async () => {
 		let releaseParent: () => void = () => {};
 		const parentRelease = new Promise<void>((resolve) => {

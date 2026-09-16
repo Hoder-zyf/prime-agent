@@ -1,7 +1,8 @@
 import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Agent } from "@earendil-works/pi-agent-core";
+import { setTimeout as sleep } from "node:timers/promises";
+import { Agent, type StreamFn } from "@earendil-works/pi-agent-core";
 import {
 	type AssistantMessage,
 	type Context,
@@ -61,6 +62,56 @@ function streamAnswer(text: string): ReturnType<typeof createAssistantMessageEve
 	return stream;
 }
 
+async function waitForCondition(condition: () => boolean, timeoutMs: number): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (!condition()) {
+		if (Date.now() >= deadline) {
+			throw new Error("Timed out waiting for condition");
+		}
+		await sleep(10);
+	}
+}
+
+/** Stream that answers only once its release promise resolves; each call gets its own gate. */
+function createGatedStream() {
+	const releases: Array<() => void> = [];
+	const startedPrompts = new Set<string>();
+	const streamFn: StreamFn = (_model, context) => {
+		const text = userText(context).replace(/^\[task from parent\]\n\n/, "");
+		const stream = createAssistantMessageEventStream();
+		startedPrompts.add(text);
+		const release = new Promise<void>((resolve) => {
+			releases.push(resolve);
+		});
+		void release.then(() => {
+			stream.push({ type: "done", reason: "stop", message: assistantMessageLike(`child answer: ${text}`) });
+		});
+		return stream;
+	};
+	return {
+		releases,
+		startedPrompts,
+		streamFn,
+		releaseAll: () =>
+			releases.forEach((release) => {
+				release();
+			}),
+	};
+}
+
+function assistantMessageLike(text: string): AssistantMessage {
+	return {
+		role: "assistant",
+		content: [{ type: "text", text }],
+		api: model.api,
+		provider: model.provider,
+		model: model.id,
+		usage: usage(),
+		stopReason: "stop",
+		timestamp: Date.now(),
+	};
+}
+
 describe("rlm.collect typed fan-in", () => {
 	let tempDir: string;
 	let session: AgentSession | undefined;
@@ -76,14 +127,16 @@ describe("rlm.collect typed fan-in", () => {
 		rmSync(tempDir, { recursive: true, force: true });
 	});
 
-	function makeSession(): AgentSession {
+	function makeSession(
+		streamFn: StreamFn = (_model, context) => streamAnswer(`child answer: ${userText(context)}`),
+	): AgentSession {
 		const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 		const agent = new Agent({
 			convertToLlm,
 			getApiKey: () => "test-key",
 			initialState: { model, systemPrompt: "", tools: [], thinkingLevel: "off" },
-			streamFn: (_model, context) => streamAnswer(`child answer: ${userText(context)}`),
+			streamFn,
 		});
 		return new AgentSession({
 			agent,
@@ -164,6 +217,75 @@ describe("rlm.collect typed fan-in", () => {
 		expect(snapshot.results).toHaveLength(1);
 		expect(snapshot.results[0].rlm_child_id).toBe(handle.rlm_child_id);
 		expect(["queued", "running", "done"]).toContain(snapshot.results[0].status);
+	});
+
+	it("returns cancelled envelopes for just-deleted targets without throwing", async () => {
+		const gate = createGatedStream();
+		session = makeSession(gate.streamFn);
+		const victim = await session.runRlmChild("victim shard", { name: "victim-worker" });
+		await waitForCondition(() => gate.startedPrompts.has("victim shard"), 10_000);
+
+		await session.deleteRlmSubagent(victim.rlm_child_id);
+
+		// The delete receipt returned while the aborted run still unwinds;
+		// collect answers with a terminal cancelled envelope instead of the
+		// unknown-selector error, and it does not spend the timeout budget.
+		const collectStartedAt = Date.now();
+		const byId = await session.collectRlmChildren([victim.rlm_child_id], 10_000);
+		expect(Date.now() - collectStartedAt).toBeLessThan(2_000);
+		expect(byId.results).toHaveLength(1);
+		expect(byId.results[0]).toMatchObject({
+			rlm_child_id: victim.rlm_child_id,
+			session_name: "victim-worker",
+			status: "cancelled",
+			settled: true,
+			error: "Deleted by parent orchestrator",
+		});
+
+		const byName = await session.collectRlmChildren(["victim-worker"], 0);
+		expect(byName.results).toHaveLength(1);
+		expect(byName.results[0]).toMatchObject({
+			rlm_child_id: victim.rlm_child_id,
+			status: "cancelled",
+			settled: true,
+		});
+
+		// Unknown selectors keep throwing; the cancelled fallback is scoped to deleted targets.
+		await expect(session.collectRlmChildren(["no-such-child"], 0)).rejects.toThrow(
+			'No direct RLM child matches "no-such-child"',
+		);
+
+		gate.releaseAll();
+		await waitForCondition(() => session!.getRlmChildRunStatus(victim.rlm_child_id) === undefined, 10_000);
+	});
+
+	it("collects live and deleted targets together", async () => {
+		const gate = createGatedStream();
+		session = makeSession(gate.streamFn);
+		const live = await session.runRlmChild("live shard", { name: "live-worker" });
+		const victim = await session.runRlmChild("victim shard", { name: "victim-worker" });
+		await waitForCondition(
+			() => gate.startedPrompts.has("live shard") && gate.startedPrompts.has("victim shard"),
+			10_000,
+		);
+		await session.deleteRlmSubagent("victim-worker");
+
+		const results = await session.collectRlmChildren([live.rlm_child_id, victim.rlm_child_id], 0);
+		const byId = new Map(results.results.map((entry) => [entry.rlm_child_id, entry]));
+		expect(byId.get(live.rlm_child_id)).toMatchObject({ session_name: "live-worker", status: "running" });
+		expect(byId.get(victim.rlm_child_id)).toMatchObject({
+			status: "cancelled",
+			settled: true,
+			error: "Deleted by parent orchestrator",
+		});
+
+		gate.releaseAll();
+		await waitForCondition(
+			() =>
+				session!.getRlmChildRunStatus(victim.rlm_child_id) === undefined &&
+				session!.getRlmChildRunStatus(live.rlm_child_id) === undefined,
+			10_000,
+		);
 	});
 
 	it("throws for unknown selectors and keeps ambiguity detection", async () => {

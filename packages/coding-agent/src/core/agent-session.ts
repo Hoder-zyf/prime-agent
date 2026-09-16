@@ -10973,7 +10973,9 @@ export class AgentSession {
 	 * never rejects on timeout — a timeout returns the current snapshots so
 	 * the caller can end its turn, poll, or retry. `targets` are child ids or
 	 * session names; an empty list means every direct child that is not being
-	 * deleted.
+	 * deleted. A target whose delete receipt already returned resolves
+	 * immediately to a settled cancelled envelope instead of an
+	 * unknown-selector error.
 	 */
 	async collectRlmChildren(targets: string[], timeoutMs: number): Promise<RlmCollectResult> {
 		const candidates = new Map<string, RlmChildRun>();
@@ -10989,6 +10991,10 @@ export class AgentSession {
 			}
 		}
 		const runs = new Map<string, RlmChildRun>();
+		// Deleted targets resolve immediately to cancelled envelopes: their delete
+		// receipt already accepted the cancellation, so waiting for the detached
+		// unwind (or reporting an unsettled snapshot) would only mislead callers.
+		const deletedRuns = new Map<string, RlmChildRun>();
 		if (targets.length === 0) {
 			for (const [childId, run] of candidates) {
 				if (!run.detachedDeletion && !this._deletingRlmChildren.has(run.id)) {
@@ -11004,7 +11010,18 @@ export class AgentSession {
 						this._rlmChildRunMatchesTarget(run, target),
 				);
 				if (matches.length === 0) {
-					throw new Error(`No direct RLM child matches "${target}" in the current parent session`);
+					const deletedMatches = [...candidates.values()].filter(
+						(run) =>
+							(run.detachedDeletion || this._deletingRlmChildren.has(run.id)) &&
+							this._rlmChildRunMatchesTarget(run, target),
+					);
+					if (deletedMatches.length === 0) {
+						throw new Error(`No direct RLM child matches "${target}" in the current parent session`);
+					}
+					for (const run of deletedMatches) {
+						deletedRuns.set(run.id, run);
+					}
+					continue;
 				}
 				if (matches.length > 1) {
 					throw new Error(`RLM child selector "${target}" is ambiguous in the current parent session`);
@@ -11037,7 +11054,12 @@ export class AgentSession {
 				}),
 			);
 		}
-		return { results: [...runs.values()].map((run) => this._rlmCollectEntryForRun(run)) };
+		return {
+			results: [
+				...[...runs.values()].map((run) => this._rlmCollectEntryForRun(run)),
+				...[...deletedRuns.values()].map((run) => this._rlmDeletedCollectEntryForRun(run)),
+			],
+		};
 	}
 
 	private _rlmChildRunMatchesTarget(run: RlmChildRun, target: string): boolean {
@@ -11063,6 +11085,22 @@ export class AgentSession {
 			duration_ms: snapshot.durationMs,
 			tool_use_count: snapshot.toolUseCount,
 			replied_since_task: snapshot.repliedSinceTask,
+		};
+	}
+
+	/**
+	 * Typed envelope for a target whose delete receipt already returned. The
+	 * detached unwind may still hold the run unsettled; the parent-facing
+	 * projection is terminal regardless, so the entry reports cancellation as a
+	 * settled answer instead of a snapshot that invites re-polling.
+	 */
+	private _rlmDeletedCollectEntryForRun(run: RlmChildRun): RlmCollectResultEntry {
+		const entry = this._rlmCollectEntryForRun(run);
+		return {
+			...entry,
+			status: "cancelled",
+			settled: true,
+			error: entry.error ?? "Deleted by parent orchestrator",
 		};
 	}
 
@@ -11704,11 +11742,21 @@ export class AgentSession {
 		if (!ignorePendingReservation && this._pendingRlmSubagentSessionNames.has(name)) {
 			throw new Error(formatAgentSessionNameUnavailable(name, depth));
 		}
+		// A delete receipt frees the name once the child runtime is bound and only
+		// the detached deletion unwind remains. A deleted startup without a bound
+		// session still reserves its name until that startup settles, because
+		// the queued runtime work can still surface under it.
+		const isDeletedDeletionRun = (run: RlmChildRun): boolean =>
+			run.detachedDeletion !== undefined && run.session !== undefined;
 		const localConflict =
 			[...this._activeRlmChildRuns.values()].some(
-				(run) => run.session?.sessionName === name || (!run.session && run.sessionName === name),
+				(run) =>
+					!isDeletedDeletionRun(run) &&
+					(run.session?.sessionName === name || (!run.session && run.sessionName === name)),
 			) ||
-			[...this._rlmChildSessions.values()].some(({ session }) => session.sessionName === name) ||
+			[...this._rlmChildSessions.values()].some(
+				({ session, run }) => !run?.detachedDeletion && session.sessionName === name,
+			) ||
 			[...this._rlmChildCleanupFailures.values()].some((entry) => entry.session_name === name);
 		if (localConflict) {
 			throw new Error(formatAgentSessionNameUnavailable(name, depth));
