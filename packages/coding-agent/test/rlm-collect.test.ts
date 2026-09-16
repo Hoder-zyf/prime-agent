@@ -155,6 +155,7 @@ describe("rlm.collect typed fan-in", () => {
 		options: {
 			agentMessageController?: AgentSessionMessageController;
 			subagentRuntimeHost?: SubagentRuntimeHost;
+			rlmSessionDir?: string;
 		} = {},
 	): AgentSession {
 		const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
@@ -174,6 +175,7 @@ describe("rlm.collect typed fan-in", () => {
 			resourceLoader: createTestResourceLoader(),
 			agentMessageController: options.agentMessageController,
 			subagentRuntimeHost: options.subagentRuntimeHost,
+			rlmSessionDir: options.rlmSessionDir,
 		});
 	}
 
@@ -720,6 +722,154 @@ describe("rlm.collect typed fan-in", () => {
 		expect(secondEnvelope.results).toHaveLength(1);
 		expect(secondEnvelope.results[0]).toMatchObject({
 			rlm_child_id: second.rlm_child_id,
+			session_name: "reused-worker",
+			status: "cancelled",
+			settled: true,
+			error: "Deleted by parent orchestrator",
+		});
+	});
+
+	it("keeps a retained completed child's cancelled envelope after its delete receipt", async () => {
+		session = makeSession();
+		const done = await session.runRlmChild("done shard", { name: "done-worker" });
+		// Terminal cleanup moves the settled run out of the active map and keeps the
+		// child retained, so the delete takes the no-active-run path.
+		await waitForCondition(() => session!.getRlmChildRunStatus(done.rlm_child_id) === undefined, 10_000);
+		const settled = await session.collectRlmChildren([done.rlm_child_id], 10_000);
+		expect(settled.results[0]).toMatchObject({ status: "done", settled: true });
+
+		await expect(session.deleteRlmSubagent(done.rlm_child_id)).resolves.toMatchObject({
+			subagent: { rlm_child_id: done.rlm_child_id },
+		});
+
+		// The receipt promises a cancelled envelope even though the run is gone.
+		const byId = await session.collectRlmChildren([done.rlm_child_id], 0);
+		expect(byId.results).toHaveLength(1);
+		expect(byId.results[0]).toMatchObject({
+			rlm_child_id: done.rlm_child_id,
+			session_name: "done-worker",
+			status: "cancelled",
+			settled: true,
+			error: "Deleted by parent orchestrator",
+		});
+		const byName = await session.collectRlmChildren(["done-worker"], 0);
+		expect(byName.results).toHaveLength(1);
+		expect(byName.results[0]).toMatchObject({
+			rlm_child_id: done.rlm_child_id,
+			status: "cancelled",
+			settled: true,
+		});
+	});
+
+	it("keeps a run-less retained child's cancelled envelope after its delete receipt", async () => {
+		const root = makeSession();
+		// The daemon registers hydrated passive children without a run, so the
+		// tombstone has to carry the registry identity instead.
+		const retainedChild = makeSession(undefined, {
+			rlmSessionDir: join(tempDir, "runless-retained"),
+		});
+		session = root;
+		retainedChild.setSessionName("runless-worker");
+		expect(root.registerRlmChildSession("runless-child", retainedChild)).toBe(true);
+
+		await expect(root.deleteRlmSubagent("runless-worker")).resolves.toMatchObject({
+			subagent: { rlm_child_id: "runless-child" },
+		});
+
+		const byId = await root.collectRlmChildren(["runless-child"], 0);
+		expect(byId.results).toHaveLength(1);
+		expect(byId.results[0]).toMatchObject({
+			rlm_child_id: "runless-child",
+			session_name: "runless-worker",
+			status: "cancelled",
+			settled: true,
+			error: "Deleted by parent orchestrator",
+		});
+		const byName = await root.collectRlmChildren(["runless-worker"], 0);
+		expect(byName.results[0]).toMatchObject({
+			rlm_child_id: "runless-child",
+			status: "cancelled",
+			settled: true,
+		});
+		// Registry identity keeps session-id selectors working without a session object.
+		const bySessionId = await root.collectRlmChildren([retainedChild.sessionId], 0);
+		expect(bySessionId.results[0]).toMatchObject({
+			rlm_child_id: "runless-child",
+			status: "cancelled",
+			settled: true,
+		});
+	});
+
+	it("keeps a run-less delete reservation off the previous generation's cancelled envelope", async () => {
+		const gate = createGatedStream();
+		let holdListing = false;
+		let releaseListing!: () => void;
+		const listingGate = new Promise<void>((resolve) => {
+			releaseListing = resolve;
+		});
+		const root = makeSession(gate.streamFn, {
+			agentMessageController: {
+				listAgents: async () => {
+					if (!holdListing) {
+						return {
+							current: { activeSessionId: "parent-active", sessionId: "parent-session" },
+							agents: [],
+						};
+					}
+					await listingGate;
+					return {
+						current: { activeSessionId: "parent-active", sessionId: "parent-session" },
+						agents: [],
+					};
+				},
+				sendAgentMessage: async () => {
+					throw new Error("unexpected send");
+				},
+			},
+		});
+		session = root;
+
+		const first = await root.runRlmChild("first shard", { name: "reused-worker" });
+		await waitForCondition(() => gate.startedPrompts.has("first shard"), 10_000);
+		await root.deleteRlmSubagent(first.rlm_child_id);
+		await waitForRlmRunCleanup(gate, root, [first.rlm_child_id]);
+		// The unwound generation is only a tombstone now, still matching the name.
+		expect((await root.collectRlmChildren([first.rlm_child_id], 0)).results[0]).toMatchObject({
+			rlm_child_id: first.rlm_child_id,
+			status: "cancelled",
+			settled: true,
+		});
+
+		// A run-less retained child reuses that name: candidates never see it, so its
+		// reservation is the only mid-preflight signal.
+		const retainedChild = makeSession(undefined, {
+			rlmSessionDir: join(tempDir, "runless-pending"),
+		});
+		session = root;
+		retainedChild.setSessionName("reused-worker");
+		expect(root.registerRlmChildSession("runless-pending", retainedChild)).toBe(true);
+
+		holdListing = true;
+		const deleting = root.deleteRlmSubagent("reused-worker");
+		// The run-less delete is undecided, so the reused selector must report no match
+		// instead of the previous generation's tombstoned envelope.
+		await expect(root.collectRlmChildren(["reused-worker"], 0)).rejects.toThrow(
+			'No direct RLM child matches "reused-worker" in the current parent session',
+		);
+
+		releaseListing();
+		await expect(deleting).resolves.toMatchObject({
+			subagent: { rlm_child_id: "runless-pending" },
+		});
+		// Both generations are deleted under the reused name, so the name is ambiguous
+		// while the run-less child keeps its own envelope by id.
+		await expect(root.collectRlmChildren(["reused-worker"], 0)).rejects.toThrow(
+			'RLM child selector "reused-worker" is ambiguous in the current parent session',
+		);
+		const runlessEnvelope = await root.collectRlmChildren(["runless-pending"], 0);
+		expect(runlessEnvelope.results).toHaveLength(1);
+		expect(runlessEnvelope.results[0]).toMatchObject({
+			rlm_child_id: "runless-pending",
 			session_name: "reused-worker",
 			status: "cancelled",
 			settled: true,

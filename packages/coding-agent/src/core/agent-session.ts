@@ -1073,6 +1073,12 @@ interface RlmSubagentModelSelection {
 }
 
 const KERNEL_STATE_LISTING_TIMEOUT_MS = 5000;
+
+/**
+ * No-model sentinel for a tombstoned run-less deletion: mirrors the agent core's
+ * unknown/unknown placeholder. Only the snapshot's `provider/id` string reads it.
+ */
+const UNKNOWN_RLM_CHILD_MODEL = { provider: "unknown", id: "unknown" } as Model<Api>;
 const RLM_MAX_DEPTH_STATE_CUSTOM_TYPE = "rlm_max_depth_state";
 /** Minimum spacing between accepted progress notes from one child session. */
 const RLM_PROGRESS_NOTE_MIN_INTERVAL_MS = 10_000;
@@ -11038,12 +11044,24 @@ export class AgentSession {
 					// deleted generation of the same selector. An accepted delete keeps
 					// its reservation until the unwind settles, so only a reservation
 					// without detachedDeletion is still inside preflight.
-					const preflight = [...candidates.values()].some(
+					const candidatePreflight = [...candidates.values()].some(
 						(run) =>
 							run.detachedDeletion === undefined &&
 							this._deletingRlmChildren.has(run.id) &&
 							this._rlmChildRunMatchesTarget(run, target),
 					);
+					// A run-less retained child is invisible to candidates, so its own
+					// reservation is the only preflight signal. A reservation is kept past
+					// the receipt only for an accepted delete with an active run, and the
+					// accepted run-less delete is excluded by its tombstone, so a visible
+					// run-less reservation is still inside preflight.
+					const runlessPreflight = [...this._deletingRlmChildren].some(
+						([childId, reservation]) =>
+							!candidates.has(childId) &&
+							!this._deletedRlmChildRuns.has(childId) &&
+							this._rlmSubagentMatchesTarget(reservation.subagent, target),
+					);
+					const preflight = candidatePreflight || runlessPreflight;
 					// A run still mid-unwind stays in candidates; one whose unwind already
 					// finished is reachable only through its tombstone.
 					const unwoundMatches = [...candidates.values()].filter(
@@ -11393,9 +11411,9 @@ export class AgentSession {
 
 	private _removeRlmSubagentTracking(childId: string, run?: RlmChildRun): void {
 		// Every removal of an accepted-delete run funnels through here, so the
-		// tombstone covers both the settled unwind and an already-settled errored
-		// delete. Other removals keep no tombstone: only a delete receipt promises
-		// a collectable cancelled envelope.
+		// tombstone covers the settled unwind, an already-settled errored delete, and
+		// the no-run retained delete. Other removals keep no tombstone: only a delete
+		// receipt promises a collectable cancelled envelope.
 		if (run?.detachedDeletion) {
 			this._deletedRlmChildRuns.set(childId, run);
 		}
@@ -11429,6 +11447,43 @@ export class AgentSession {
 				error: "Deleted by parent orchestrator",
 			},
 		});
+	}
+
+	/**
+	 * Accepted-delete marker for a child removed without an active run: a retained
+	 * completed child, or a daemon-hydrated passive child that never had one. The
+	 * retained run is reused when the parent still holds it, because it is already
+	 * out of both lookup maps by removal time and the tombstone is its only
+	 * remaining reader; otherwise the tombstone carries the registry snapshot.
+	 */
+	private _runForRetainedRlmChildDeletion(
+		childId: string,
+		subagent: RlmSubagentRegistryEntry,
+		retained: RetainedRlmChild | undefined,
+	): RlmChildRun {
+		if (retained?.run) {
+			retained.run.detachedDeletion = subagent;
+			return retained.run;
+		}
+		return {
+			id: childId,
+			prompt: subagent.label ?? "",
+			sessionName: subagent.session_name,
+			sessionDir: subagent.session_dir,
+			model: retained?.session.model ?? this.model ?? UNKNOWN_RLM_CHILD_MODEL,
+			status: "cancelled",
+			durationMs: subagent.duration_ms,
+			answerPreview: subagent.answer_preview,
+			toolUseCount: subagent.tool_use_count ?? 0,
+			progressNotes: subagent.progress_note ? [subagent.progress_note] : [],
+			error: "Deleted by parent orchestrator",
+			abort: noopRlmChildAbort,
+			publication: createAgentMessageDeferred(),
+			settlement: createAgentMessageDeferred(),
+			settled: true,
+			deletionReservation: createAgentMessageDeferred(),
+			detachedDeletion: subagent,
+		};
 	}
 
 	private async _deleteResolvedRlmSubagent(subagent: RlmSubagentRegistryEntry): Promise<RlmDeleteSubagentResult> {
@@ -11473,20 +11528,22 @@ export class AgentSession {
 		}
 
 		this._emitRlmSubagentRemoval(subagent);
-		const retained = this._rlmChildSessions.get(childId)?.session;
+		const retained = this._rlmChildSessions.get(childId);
 		try {
-			await this._deleteRlmSubagentSession(childId, retained);
+			await this._deleteRlmSubagentSession(childId, retained?.session);
 		} catch (error) {
 			if (this._disposed || this._disposing) {
 				this._removeRlmSubagentTracking(childId);
-				void retained?.disposeAsync().catch(() => undefined);
+				void retained?.session.disposeAsync().catch(() => undefined);
 			} else {
 				this._rlmChildCleanupFailures.set(childId, subagent);
 			}
 			throw error;
 		}
 		this._deletedRlmChildIds.add(childId);
-		this._removeRlmSubagentTracking(childId);
+		// The receipt promises a collectable cancelled envelope, so a child deleted
+		// without an active run still needs its accepted-delete tombstone.
+		this._removeRlmSubagentTracking(childId, this._runForRetainedRlmChildDeletion(childId, subagent, retained));
 		return { subagent };
 	}
 
