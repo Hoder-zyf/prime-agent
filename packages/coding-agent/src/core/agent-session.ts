@@ -1551,6 +1551,11 @@ export class AgentSession {
 	// the daemon does the same by leaving the child session resident in its registry.
 	private _rlmChildSessions = new Map<string, RetainedRlmChild>();
 	private _deletedRlmChildIds = new Set<string>();
+	// An accepted delete outlives the run it cancelled: once the run is removed
+	// from both lookup maps, this tombstone keeps the child's identity so collect
+	// can still answer with its settled cancelled envelope.
+	// Entries live until the parent session is disposed, like _deletedRlmChildIds.
+	private _deletedRlmChildRuns = new Map<string, RlmChildRun>();
 	// Failed explicit deletes stay hidden from listings but retain their original
 	// selector so a later delete can retry cleanup without orphaning the runtime.
 	private _rlmChildCleanupFailures = new Map<string, RlmSubagentRegistryEntry>();
@@ -4791,6 +4796,7 @@ export class AgentSession {
 		this._rlmChildSessions.clear();
 		this._rlmChildCleanupFailures.clear();
 		this._deletedRlmChildIds.clear();
+		this._deletedRlmChildRuns.clear();
 		try {
 			await this._ipythonKernelProvisioner?.dispose({ snapshot: kernelSnapshot });
 		} catch {
@@ -4854,6 +4860,7 @@ export class AgentSession {
 			this._rlmChildSessions.clear();
 			this._rlmChildCleanupFailures.clear();
 			this._deletedRlmChildIds.clear();
+			this._deletedRlmChildRuns.clear();
 			this._pendingNextTurnMessages = [];
 			const deliveryError = new Error("Session disposed before prompt delivery.");
 			const completionError = new Error("Session disposed before prompt completion.");
@@ -11005,7 +11012,12 @@ export class AgentSession {
 		// selector throws no-match instead, exactly like a fresh-name collect
 		// racing its own delete preflight. An accepted delete keeps its
 		// _deletingRlmChildren reservation until the unwind settles, so only a
-		// reservation without detachedDeletion blocks the fallback.
+		// reservation without detachedDeletion blocks the fallback. Once the
+		// unwind does settle, the run leaves both lookup maps and only its
+		// _deletedRlmChildRuns tombstone still carries the receipt-bound identity,
+		// so a later collect keeps answering with the same cancelled envelope. A
+		// mid-preflight run blocks tombstone matches too: that delete can still
+		// fail and leave a live replacement under the reused selector.
 		const deletedRuns = new Map<string, RlmChildRun>();
 		if (targets.length === 0) {
 			for (const [childId, run] of candidates) {
@@ -11032,11 +11044,16 @@ export class AgentSession {
 							this._deletingRlmChildren.has(run.id) &&
 							this._rlmChildRunMatchesTarget(run, target),
 					);
-					const deletedMatches = preflight
-						? []
-						: [...candidates.values()].filter(
-								(run) => run.detachedDeletion && this._rlmChildRunMatchesTarget(run, target),
-							);
+					// A run still mid-unwind stays in candidates; one whose unwind already
+					// finished is reachable only through its tombstone.
+					const unwoundMatches = [...candidates.values()].filter(
+						(run) => run.detachedDeletion && this._rlmChildRunMatchesTarget(run, target),
+					);
+					const unwoundIds = new Set(unwoundMatches.map((run) => run.id));
+					const tombstoneMatches = [...this._deletedRlmChildRuns.values()].filter(
+						(run) => !unwoundIds.has(run.id) && this._rlmDeletedRunMatchesTarget(run, target),
+					);
+					const deletedMatches = preflight ? [] : [...unwoundMatches, ...tombstoneMatches];
 					if (deletedMatches.length === 0) {
 						throw new Error(`No direct RLM child matches "${target}" in the current parent session`);
 					}
@@ -11092,6 +11109,17 @@ export class AgentSession {
 			run.sessionName === target ||
 			session?.sessionId === target ||
 			session?.sessionName === target
+		);
+	}
+
+	/**
+	 * Tombstoned runs have no session object left, so registry identity stands in
+	 * for the session selectors a mid-unwind run still answered to.
+	 */
+	private _rlmDeletedRunMatchesTarget(run: RlmChildRun, target: string): boolean {
+		return (
+			this._rlmChildRunMatchesTarget(run, target) ||
+			(run.detachedDeletion !== undefined && this._rlmSubagentMatchesTarget(run.detachedDeletion, target))
 		);
 	}
 
@@ -11364,6 +11392,13 @@ export class AgentSession {
 	}
 
 	private _removeRlmSubagentTracking(childId: string, run?: RlmChildRun): void {
+		// Every removal of an accepted-delete run funnels through here, so the
+		// tombstone covers both the settled unwind and an already-settled errored
+		// delete. Other removals keep no tombstone: only a delete receipt promises
+		// a collectable cancelled envelope.
+		if (run?.detachedDeletion) {
+			this._deletedRlmChildRuns.set(childId, run);
+		}
 		run?.unsubscribe?.();
 		this._rlmChildUnsubscribes.get(childId)?.();
 		this._rlmChildUnsubscribes.delete(childId);
