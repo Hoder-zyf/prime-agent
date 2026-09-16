@@ -10994,6 +10994,10 @@ export class AgentSession {
 		// Deleted targets resolve immediately to cancelled envelopes: their delete
 		// receipt already accepted the cancellation, so waiting for the detached
 		// unwind (or reporting an unsettled snapshot) would only mislead callers.
+		// Only detachedDeletion marks an accepted delete. A run merely reserved in
+		// _deletingRlmChildren is still inside delete preflight and can surface a
+		// passive-selector conflict that fails the delete, so it stays hidden from
+		// collect like every other selector view until the delete settles.
 		const deletedRuns = new Map<string, RlmChildRun>();
 		if (targets.length === 0) {
 			for (const [childId, run] of candidates) {
@@ -11011,16 +11015,15 @@ export class AgentSession {
 				);
 				if (matches.length === 0) {
 					const deletedMatches = [...candidates.values()].filter(
-						(run) =>
-							(run.detachedDeletion || this._deletingRlmChildren.has(run.id)) &&
-							this._rlmChildRunMatchesTarget(run, target),
+						(run) => run.detachedDeletion && this._rlmChildRunMatchesTarget(run, target),
 					);
 					if (deletedMatches.length === 0) {
 						throw new Error(`No direct RLM child matches "${target}" in the current parent session`);
 					}
-					for (const run of deletedMatches) {
-						deletedRuns.set(run.id, run);
+					if (deletedMatches.length > 1) {
+						throw new Error(`RLM child selector "${target}" is ambiguous in the current parent session`);
 					}
+					deletedRuns.set(deletedMatches[0].id, deletedMatches[0]);
 					continue;
 				}
 				if (matches.length > 1) {

@@ -12,6 +12,7 @@ import {
 	type Usage,
 } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import type { AgentSessionMessageController } from "../src/core/agent-messages.js";
 import { AgentSession } from "../src/core/agent-session.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { convertToLlm } from "../src/core/messages.js";
@@ -129,6 +130,7 @@ describe("rlm.collect typed fan-in", () => {
 
 	function makeSession(
 		streamFn: StreamFn = (_model, context) => streamAnswer(`child answer: ${userText(context)}`),
+		options: { agentMessageController?: AgentSessionMessageController } = {},
 	): AgentSession {
 		const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
@@ -145,6 +147,7 @@ describe("rlm.collect typed fan-in", () => {
 			cwd: tempDir,
 			modelRegistry: ModelRegistry.create(authStorage, join(tempDir, "models.json")),
 			resourceLoader: createTestResourceLoader(),
+			agentMessageController: options.agentMessageController,
 		});
 	}
 
@@ -286,6 +289,132 @@ describe("rlm.collect typed fan-in", () => {
 				session!.getRlmChildRunStatus(live.rlm_child_id) === undefined,
 			10_000,
 		);
+	});
+
+	it("throws ambiguity when a deleted selector matches several detached runs", async () => {
+		const gate = createGatedStream();
+		session = makeSession(gate.streamFn);
+		const first = await session.runRlmChild("first shard", { name: "reused-worker" });
+		await waitForCondition(() => gate.startedPrompts.has("first shard"), 10_000);
+
+		// A delete receipt frees the name, so a reused selector can race two
+		// accepted deletes whose detached unwinds are still pending. The second
+		// mid-unwind record is injected exactly like the sibling-recursion
+		// fixtures do: real concurrent deleted runs cannot be spawned twice in
+		// one tick, and collect must still refuse the ambiguous selector.
+		const internals = session as unknown as {
+			_activeRlmChildRuns: Map<string, Record<string, unknown>>;
+		};
+		const injectedDetachedRun = {
+			id: "injected-deleted-run",
+			prompt: "hidden parent",
+			sessionName: "reused-worker",
+			sessionDir: join(tempDir, "injected-deleted-run"),
+			model,
+			abort: () => {},
+			status: "cancelled",
+			settled: false,
+			progressNotes: [],
+			detachedDeletion: {
+				rlm_child_id: "injected-deleted-run",
+				active_session_id: null,
+				session_id: null,
+				session_name: "reused-worker",
+				session_dir: join(tempDir, "injected-deleted-run"),
+				status: "running",
+			},
+		};
+		internals._activeRlmChildRuns.set("injected-deleted-run", injectedDetachedRun);
+
+		await session.deleteRlmSubagent(first.rlm_child_id);
+		// Both deleted runs match the reused name; a single selector cannot
+		// resolve to several envelopes, exactly like the live branch.
+		await expect(session.collectRlmChildren(["reused-worker"], 0)).rejects.toThrow(
+			'RLM child selector "reused-worker" is ambiguous in the current parent session',
+		);
+
+		// Each deleted run stays individually addressable by id.
+		const byId = await session.collectRlmChildren([first.rlm_child_id, "injected-deleted-run"], 0);
+		expect(byId.results).toHaveLength(2);
+		expect(byId.results.every((entry) => entry.status === "cancelled" && entry.settled)).toBe(true);
+
+		// These are deliberately minimal lifecycle records; remove the injected
+		// run before fixture teardown asks real runs to settle.
+		internals._activeRlmChildRuns.delete("injected-deleted-run");
+		gate.releaseAll();
+		await waitForCondition(() => session!.getRlmChildRunStatus(first.rlm_child_id) === undefined, 10_000);
+	});
+
+	it("does not report a settled cancellation while a delete preflight can still fail", async () => {
+		const gate = createGatedStream();
+		let holdListing = false;
+		let releaseListing!: () => void;
+		const listingGate = new Promise<void>((resolve) => {
+			releaseListing = resolve;
+		});
+		session = makeSession(gate.streamFn, {
+			agentMessageController: {
+				listAgents: async () => {
+					if (!holdListing) {
+						return {
+							current: { activeSessionId: "parent-active", sessionId: "parent-session" },
+							agents: [],
+						};
+					}
+					await listingGate;
+					return {
+						current: { activeSessionId: "parent-active", sessionId: "parent-session" },
+						agents: [
+							{
+								activeSessionId: "passive-active",
+								sessionId: "passive-session",
+								sessionName: "victim-worker",
+								runtimeKind: "subagent" as const,
+								cwd: tempDir,
+								isStreaming: false,
+								unfinishedActionCount: 0,
+								parentActiveSessionId: "parent-active",
+								rlmChildId: "passive-child",
+								sessionDir: join(tempDir, "passive-child"),
+							},
+						],
+					};
+				},
+				sendAgentMessage: async () => {
+					throw new Error("unexpected send");
+				},
+			},
+		});
+		const victim = await session.runRlmChild("victim shard", { name: "victim-worker" });
+		await waitForCondition(() => gate.startedPrompts.has("victim shard"), 10_000);
+
+		// The delete reserves the run synchronously, then blocks on the daemon
+		// listing preflight that will find a conflicting passive selector.
+		holdListing = true;
+		const deleting = session.deleteRlmSubagent("victim-worker");
+		// Mid-preflight the delete can still fail, so collect must not answer
+		// with a settled cancelled envelope; the reserved run is simply hidden.
+		await expect(session.collectRlmChildren(["victim-worker"], 0)).rejects.toThrow(
+			'No direct RLM child matches "victim-worker" in the current parent session',
+		);
+
+		releaseListing();
+		await expect(deleting).rejects.toThrow(
+			'RLM subagent selector "victim-worker" is ambiguous in the current parent session',
+		);
+
+		// The failed delete cleared the reservation: the child is live and
+		// collectable again, not silently cancelled.
+		const live = await session.collectRlmChildren(["victim-worker"], 0);
+		expect(live.results).toHaveLength(1);
+		expect(live.results[0]).toMatchObject({
+			rlm_child_id: victim.rlm_child_id,
+			status: "running",
+			settled: false,
+		});
+
+		gate.releaseAll();
+		await session.collectRlmChildren([victim.rlm_child_id], 10_000);
 	});
 
 	it("throws for unknown selectors and keeps ambiguity detection", async () => {
