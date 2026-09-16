@@ -36,6 +36,7 @@ import {
 	AgentSessionMessageRateLimiter,
 	type AgentSessionMessageReceipt,
 	type AgentSessionMessageSender,
+	type AgentSessionNameAvailabilityInput,
 	agentFamilyRelationship,
 	assertAgentFamilyReach,
 	assertAgentSessionNameAvailable,
@@ -5961,13 +5962,7 @@ export class AgentDaemon {
 	}
 
 	private async assertFamilySessionNameAvailable(
-		input: {
-			name: string;
-			depth: number;
-			parentSessionId?: string;
-			parentSessionPath?: string;
-			ignoreSessionId?: string;
-		},
+		input: AgentSessionNameAvailabilityInput,
 		currentState?: ActiveSessionState,
 		ignorePendingReservation = false,
 	): Promise<void> {

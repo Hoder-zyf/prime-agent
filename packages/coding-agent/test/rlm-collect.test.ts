@@ -17,7 +17,7 @@ import { AgentSession } from "../src/core/agent-session.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { convertToLlm } from "../src/core/messages.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
-import { createRlmCollectHostHandler } from "../src/core/rlm-runtime.js";
+import { createRlmCollectHostHandler, type SubagentRuntimeHost } from "../src/core/rlm-runtime.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import { createTestResourceLoader } from "./utilities.js";
@@ -130,7 +130,10 @@ describe("rlm.collect typed fan-in", () => {
 
 	function makeSession(
 		streamFn: StreamFn = (_model, context) => streamAnswer(`child answer: ${userText(context)}`),
-		options: { agentMessageController?: AgentSessionMessageController } = {},
+		options: {
+			agentMessageController?: AgentSessionMessageController;
+			subagentRuntimeHost?: SubagentRuntimeHost;
+		} = {},
 	): AgentSession {
 		const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
@@ -148,6 +151,7 @@ describe("rlm.collect typed fan-in", () => {
 			modelRegistry: ModelRegistry.create(authStorage, join(tempDir, "models.json")),
 			resourceLoader: createTestResourceLoader(),
 			agentMessageController: options.agentMessageController,
+			subagentRuntimeHost: options.subagentRuntimeHost,
 		});
 	}
 
@@ -415,6 +419,135 @@ describe("rlm.collect typed fan-in", () => {
 
 		gate.releaseAll();
 		await session.collectRlmChildren([victim.rlm_child_id], 10_000);
+	});
+
+	it("keeps a reused selector off the previous generation's cancelled envelope during delete preflight", async () => {
+		const gate = createGatedStream();
+		// The first generation's cleanup stays open, so its accepted delete remains
+		// the stale envelope a reused selector could resolve to by mistake.
+		let releaseCleanup: () => void = () => {};
+		const cleanupGate = new Promise<void>((resolve) => {
+			releaseCleanup = resolve;
+		});
+		let holdListing = false;
+		let releaseListing!: () => void;
+		const listingGate = new Promise<void>((resolve) => {
+			releaseListing = resolve;
+		});
+		const hostedChildren: AgentSession[] = [];
+		const makeHostedChild = (): AgentSession => {
+			const root = session;
+			const child = makeSession(gate.streamFn);
+			// Hosted children are torn down by this test, so the suite teardown keeps
+			// targeting the parent it owns.
+			session = root;
+			hostedChildren.push(child);
+			return child;
+		};
+		const root = makeSession(gate.streamFn, {
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => ({ session: makeHostedChild() }),
+				deleteRlmSubagentRuntime: async () => {
+					await cleanupGate;
+				},
+			},
+			agentMessageController: {
+				listAgents: async () => {
+					if (!holdListing) {
+						return {
+							current: { activeSessionId: "parent-active", sessionId: "parent-session" },
+							agents: [],
+						};
+					}
+					await listingGate;
+					return {
+						current: { activeSessionId: "parent-active", sessionId: "parent-session" },
+						agents: [
+							{
+								activeSessionId: "passive-active",
+								sessionId: "passive-session",
+								sessionName: "reused-worker",
+								runtimeKind: "subagent" as const,
+								cwd: tempDir,
+								isStreaming: false,
+								unfinishedActionCount: 0,
+								parentActiveSessionId: "parent-active",
+								rlmChildId: "passive-child",
+								sessionDir: join(tempDir, "passive-child"),
+							},
+						],
+					};
+				},
+				sendAgentMessage: async () => {
+					throw new Error("unexpected send");
+				},
+			},
+		});
+
+		const first = await root.runRlmChild("first shard", { name: "reused-worker" });
+		await waitForCondition(() => gate.startedPrompts.has("first shard"), 10_000);
+		// The delete receipt frees the name while the first generation still unwinds.
+		await root.deleteRlmSubagent(first.rlm_child_id);
+		const replacement = await root.runRlmChild("replacement shard", { name: "reused-worker" });
+		expect(replacement.rlm_child_id).not.toBe(first.rlm_child_id);
+		await waitForCondition(() => gate.startedPrompts.has("replacement shard"), 10_000);
+
+		// The replacement is reserved but still inside its delete preflight, which can
+		// fail and leave the replacement running. The previous generation's accepted
+		// delete matches the same reused name, so the deleted fallback must not answer
+		// the selector with that stale cancelled envelope.
+		holdListing = true;
+		const deleting = root.deleteRlmSubagent(replacement.rlm_child_id);
+		await expect(root.collectRlmChildren(["reused-worker"], 0)).rejects.toThrow(
+			'No direct RLM child matches "reused-worker" in the current parent session',
+		);
+		// Addressing the reserved generation by id is the same no-match answer.
+		await expect(root.collectRlmChildren([replacement.rlm_child_id], 0)).rejects.toThrow(
+			'No direct RLM child matches "',
+		);
+
+		releaseListing();
+		await expect(deleting).resolves.toMatchObject({
+			subagent: { rlm_child_id: replacement.rlm_child_id },
+		});
+		// Once the receipt returns, both generations are accepted deletes under the
+		// same reused name, so the selector is ambiguous rather than silently one
+		// generation. Each generation stays addressable through its own envelope.
+		await expect(root.collectRlmChildren(["reused-worker"], 0)).rejects.toThrow(
+			'RLM child selector "reused-worker" is ambiguous in the current parent session',
+		);
+		const deletedReplacement = await root.collectRlmChildren([replacement.rlm_child_id], 0);
+		expect(deletedReplacement.results).toHaveLength(1);
+		expect(deletedReplacement.results[0]).toMatchObject({
+			rlm_child_id: replacement.rlm_child_id,
+			session_name: "reused-worker",
+			status: "cancelled",
+			settled: true,
+			error: "Deleted by parent orchestrator",
+		});
+		const deletedFirst = await root.collectRlmChildren([first.rlm_child_id], 0);
+		expect(deletedFirst.results).toHaveLength(1);
+		expect(deletedFirst.results[0]).toMatchObject({
+			rlm_child_id: first.rlm_child_id,
+			status: "cancelled",
+			settled: true,
+		});
+
+		// Both generations unwind once their cleanup and their gated shards are
+		// released; every wait is bounded.
+		releaseCleanup();
+		const cleanupDeadline = Date.now() + 10_000;
+		while (
+			Date.now() < cleanupDeadline &&
+			(root.getRlmChildRunStatus(first.rlm_child_id) !== undefined ||
+				root.getRlmChildRunStatus(replacement.rlm_child_id) !== undefined)
+		) {
+			gate.releaseAll();
+			await sleep(20);
+		}
+		expect(root.getRlmChildRunStatus(first.rlm_child_id)).toBeUndefined();
+		expect(root.getRlmChildRunStatus(replacement.rlm_child_id)).toBeUndefined();
+		for (const hosted of hostedChildren) hosted.dispose();
 	});
 
 	it("throws for unknown selectors and keeps ambiguity detection", async () => {

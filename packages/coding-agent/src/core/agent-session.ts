@@ -10997,7 +10997,15 @@ export class AgentSession {
 		// Only detachedDeletion marks an accepted delete. A run merely reserved in
 		// _deletingRlmChildren is still inside delete preflight and can surface a
 		// passive-selector conflict that fails the delete, so it stays hidden from
-		// collect like every other selector view until the delete settles.
+		// collect like every other selector view until the delete settles. That
+		// preflight reservation also blocks the deleted fallback: a reused name
+		// makes the previous generation's accepted delete match the same selector,
+		// and answering with its cancelled envelope would report a run that is not
+		// the target while the new delete can still fail and leave it live. The
+		// selector throws no-match instead, exactly like a fresh-name collect
+		// racing its own delete preflight. An accepted delete keeps its
+		// _deletingRlmChildren reservation until the unwind settles, so only a
+		// reservation without detachedDeletion blocks the fallback.
 		const deletedRuns = new Map<string, RlmChildRun>();
 		if (targets.length === 0) {
 			for (const [childId, run] of candidates) {
@@ -11014,9 +11022,21 @@ export class AgentSession {
 						this._rlmChildRunMatchesTarget(run, target),
 				);
 				if (matches.length === 0) {
-					const deletedMatches = [...candidates.values()].filter(
-						(run) => run.detachedDeletion && this._rlmChildRunMatchesTarget(run, target),
+					// Mid-preflight runs stay hidden and must not fall through to the
+					// deleted generation of the same selector. An accepted delete keeps
+					// its reservation until the unwind settles, so only a reservation
+					// without detachedDeletion is still inside preflight.
+					const preflight = [...candidates.values()].some(
+						(run) =>
+							run.detachedDeletion === undefined &&
+							this._deletingRlmChildren.has(run.id) &&
+							this._rlmChildRunMatchesTarget(run, target),
 					);
+					const deletedMatches = preflight
+						? []
+						: [...candidates.values()].filter(
+								(run) => run.detachedDeletion && this._rlmChildRunMatchesTarget(run, target),
+							);
 					if (deletedMatches.length === 0) {
 						throw new Error(`No direct RLM child matches "${target}" in the current parent session`);
 					}
@@ -11749,12 +11769,24 @@ export class AgentSession {
 		// the detached deletion unwind remains. A deleted startup without a bound
 		// session still reserves its name until that startup settles, because
 		// the queued runtime work can still surface under it.
-		const isDeletedDeletionRun = (run: RlmChildRun): boolean =>
-			run.detachedDeletion !== undefined && run.session !== undefined;
+		const freedSessionId = (run: RlmChildRun): string | undefined =>
+			run.detachedDeletion !== undefined ? run.session?.sessionId : undefined;
+		// A daemon catalog still lists the closing child under its old name while
+		// the detached unwind runs, which is after the delete receipt returned.
+		// Forward every freed session id so both controller paths below admit the
+		// immediate same-name respawn the receipt already promised.
+		const ignoreSessionIds = new Set<string>();
+		for (const run of this._activeRlmChildRuns.values()) {
+			const sessionId = freedSessionId(run);
+			if (sessionId) ignoreSessionIds.add(sessionId);
+		}
+		for (const { session, run } of this._rlmChildSessions.values()) {
+			if (run && freedSessionId(run)) ignoreSessionIds.add(session.sessionId);
+		}
 		const localConflict =
 			[...this._activeRlmChildRuns.values()].some(
 				(run) =>
-					!isDeletedDeletionRun(run) &&
+					freedSessionId(run) === undefined &&
 					(run.session?.sessionName === name || (!run.session && run.sessionName === name)),
 			) ||
 			[...this._rlmChildSessions.values()].some(
@@ -11771,6 +11803,7 @@ export class AgentSession {
 			depth,
 			parentSessionId: this.sessionId,
 			parentSessionPath: this.sessionFile,
+			...(ignoreSessionIds.size > 0 ? { ignoreSessionIds: [...ignoreSessionIds] } : {}),
 		};
 		if (controller.assertSessionNameAvailable) {
 			await controller.assertSessionNameAvailable(input);

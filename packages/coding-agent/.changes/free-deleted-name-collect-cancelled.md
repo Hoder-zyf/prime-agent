@@ -1,2 +1,4 @@
 - Fixed `rlm.delete_subagent` holding a deleted child's session name until its background unwind finished: the name now frees at the delete receipt, so a replacement child can be spawned immediately under the same name.
 - Fixed `rlm.collect` throwing `No direct RLM child matches` when a requested target was deleted moments earlier: collect now returns a settled `cancelled` envelope for just-deleted targets immediately, without spending the timeout budget.
+- Fixed a daemon-mode respawn under a just-deleted child's name failing the name check: the delete receipt now frees the child's session name in the daemon catalog too, instead of only in the parent session's local run map.
+- Fixed `rlm.collect` resolving a reused child name to the previous generation's `cancelled` envelope while the new child's delete was still in preflight: the selector now reports no match until the delete settles.
