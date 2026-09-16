@@ -11023,7 +11023,11 @@ export class AgentSession {
 		// _deletedRlmChildRuns tombstone still carries the receipt-bound identity,
 		// so a later collect keeps answering with the same cancelled envelope. A
 		// mid-preflight run blocks tombstone matches too: that delete can still
-		// fail and leave a live replacement under the reused selector.
+		// fail and leave a live replacement under the reused selector. The same
+		// protection must not end at preflight: a run-less retained child is
+		// invisible to candidates, yet while it is live it owns its reused name, so
+		// the deleted generation of that name never answers for it. A live
+		// replacement of a reused name always beats the deleted-generation fallback.
 		const deletedRuns = new Map<string, RlmChildRun>();
 		if (targets.length === 0) {
 			for (const [childId, run] of candidates) {
@@ -11062,6 +11066,23 @@ export class AgentSession {
 							this._rlmSubagentMatchesTarget(reservation.subagent, target),
 					);
 					const preflight = candidatePreflight || runlessPreflight;
+					// A live run-less retained child (a daemon-hydrated child, for example)
+					// never enters candidates, so without this scan the deleted generation
+					// of a reused name would answer for it. While the replacement is live
+					// — no reservation, receipt, or failed cleanup hides it — it owns the
+					// selector, so both deleted-generation fallbacks stay silent and the
+					// selector throws no-match, exactly like the mid-preflight convention.
+					const liveRunlessMatch = [...this._rlmChildSessions].some(
+						([childId, retained]) =>
+							!retained.run &&
+							!candidates.has(childId) &&
+							!this._deletingRlmChildren.has(childId) &&
+							!this._deletedRlmChildIds.has(childId) &&
+							!this._rlmChildCleanupFailures.has(childId) &&
+							(childId === target ||
+								retained.session.sessionId === target ||
+								retained.session.sessionName === target),
+					);
 					// A run still mid-unwind stays in candidates; one whose unwind already
 					// finished is reachable only through its tombstone.
 					const unwoundMatches = [...candidates.values()].filter(
@@ -11071,7 +11092,7 @@ export class AgentSession {
 					const tombstoneMatches = [...this._deletedRlmChildRuns.values()].filter(
 						(run) => !unwoundIds.has(run.id) && this._rlmDeletedRunMatchesTarget(run, target),
 					);
-					const deletedMatches = preflight ? [] : [...unwoundMatches, ...tombstoneMatches];
+					const deletedMatches = preflight || liveRunlessMatch ? [] : [...unwoundMatches, ...tombstoneMatches];
 					if (deletedMatches.length === 0) {
 						throw new Error(`No direct RLM child matches "${target}" in the current parent session`);
 					}

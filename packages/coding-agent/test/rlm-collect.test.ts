@@ -877,6 +877,63 @@ describe("rlm.collect typed fan-in", () => {
 		});
 	});
 
+	it("keeps a live run-less replacement off the deleted generation's cancelled envelope", async () => {
+		const gate = createGatedStream();
+		const root = makeSession(gate.streamFn);
+		session = root;
+
+		const first = await root.runRlmChild("first shard", { name: "reused-worker" });
+		await waitForCondition(() => gate.startedPrompts.has("first shard"), 10_000);
+		await root.deleteRlmSubagent(first.rlm_child_id);
+		await waitForRlmRunCleanup(gate, root, [first.rlm_child_id]);
+		// The unwound generation is only a tombstone now, still matching the name.
+		expect((await root.collectRlmChildren([first.rlm_child_id], 0)).results[0]).toMatchObject({
+			rlm_child_id: first.rlm_child_id,
+			status: "cancelled",
+			settled: true,
+		});
+
+		// A live run-less retained child reuses the name: candidates never see it,
+		// so it must own the selector instead of the deleted generation's envelope.
+		const retainedChild = makeSession(undefined, {
+			rlmSessionDir: join(tempDir, "runless-live"),
+		});
+		session = root;
+		retainedChild.setSessionName("reused-worker");
+		expect(root.registerRlmChildSession("runless-live", retainedChild)).toBe(true);
+
+		await expect(root.collectRlmChildren(["reused-worker"], 0)).rejects.toThrow(
+			'No direct RLM child matches "reused-worker" in the current parent session',
+		);
+		// The live replacement hides only the reused name: the deleted generation
+		// keeps its cancelled envelope under its own child id.
+		const byOldId = await root.collectRlmChildren([first.rlm_child_id], 0);
+		expect(byOldId.results).toHaveLength(1);
+		expect(byOldId.results[0]).toMatchObject({
+			rlm_child_id: first.rlm_child_id,
+			status: "cancelled",
+			settled: true,
+		});
+
+		await expect(root.deleteRlmSubagent("reused-worker")).resolves.toMatchObject({
+			subagent: { rlm_child_id: "runless-live" },
+		});
+		// Both generations are deleted under the reused name, so the name is ambiguous
+		// while the run-less replacement keeps its own envelope by id.
+		await expect(root.collectRlmChildren(["reused-worker"], 0)).rejects.toThrow(
+			'RLM child selector "reused-worker" is ambiguous in the current parent session',
+		);
+		const runlessEnvelope = await root.collectRlmChildren(["runless-live"], 0);
+		expect(runlessEnvelope.results).toHaveLength(1);
+		expect(runlessEnvelope.results[0]).toMatchObject({
+			rlm_child_id: "runless-live",
+			session_name: "reused-worker",
+			status: "cancelled",
+			settled: true,
+			error: "Deleted by parent orchestrator",
+		});
+	});
+
 	it("throws for unknown selectors and keeps ambiguity detection", async () => {
 		session = makeSession();
 		await expect(session.collectRlmChildren(["no-such-child"], 0)).rejects.toThrow(
