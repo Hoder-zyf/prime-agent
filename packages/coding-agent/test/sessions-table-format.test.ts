@@ -100,20 +100,6 @@ describe("formatSessionsTable", () => {
 		);
 	});
 
-	it("reports a failed worker state as both activity and last error", () => {
-		expectTable(
-			[
-				makeSummary({
-					id: "crashed-agent",
-					activeSessionId: "active-crashed",
-					activity: "idle",
-					workerState: "failed",
-				}),
-			],
-			[["crashed-agent", "idle", "failed", "2h", "worker failed", ""]],
-		);
-	});
-
 	it("prefers the latest error diagnostic over the worker mark and fallback notice", () => {
 		expectTable(
 			[
@@ -212,7 +198,7 @@ describe("formatSessionsTable", () => {
 		);
 	});
 
-	it("sorts failures first, then running, then idle, then the rest", () => {
+	it("sorts failures first, then recovering workers, then running, then idle, then the rest", () => {
 		expectTable(
 			[
 				makeSummary({ id: "plain-saved", activity: "idle", rosterStatus: "inactive" }),
@@ -221,7 +207,7 @@ describe("formatSessionsTable", () => {
 					id: "crashed",
 					activeSessionId: "active-crashed",
 					activity: "idle",
-					statusLabel: "failed",
+					workerState: "failed",
 				}),
 				makeSummary({
 					id: "sleeper",
@@ -229,9 +215,16 @@ describe("formatSessionsTable", () => {
 					activity: "idle",
 					taskState: "completed",
 				}),
+				makeSummary({
+					id: "restarting",
+					activeSessionId: "active-restarting",
+					activity: "idle",
+					workerState: "recovering",
+				}),
 			],
 			[
-				["crashed", "failed", "", "2h", "worker failed", ""],
+				["crashed", "idle", "failed", "2h", "worker failed", ""],
+				["restarting", "idle", "recovering", "2h", "", ""],
 				["worker", "running", "thinking", "2h", "", ""],
 				["sleeper", "idle", "completed", "2h", "", ""],
 				["plain-saved", "inactive", "", "2h", "", ""],

@@ -46,7 +46,7 @@ function sortSessionsForTable(sessions: readonly SessionSummary[]): SessionSumma
 
 function sessionsSortKey(summary: SessionSummary): number {
 	if (summary.statusLabel === "failed" || summary.workerState === "failed") return 0;
-	if (summary.statusLabel === "recovering") return 1;
+	if (summary.statusLabel === "recovering" || summary.workerState === "recovering") return 1;
 	if (summary.statusLabel === "queued" || sessionRosterStatus(summary) === "running") return 2;
 	if (sessionRosterStatus(summary) === "idle") return 3;
 	return 4;
