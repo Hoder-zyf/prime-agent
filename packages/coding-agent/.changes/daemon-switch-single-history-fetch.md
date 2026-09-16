@@ -1,0 +1,1 @@
+- Fixed session switches fetching the full transcript twice, halving the history bytes the client reads when switching to a large session.

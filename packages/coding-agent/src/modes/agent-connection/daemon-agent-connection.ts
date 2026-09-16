@@ -113,6 +113,17 @@ interface DaemonSnapshotAssembly {
 	timeout: ReturnType<typeof setTimeout>;
 }
 
+/**
+ * The streamed replacement snapshot a switchSession call waits on, so a later
+ * getInitialSnapshot reads the applied cache instead of refetching the
+ * transcript.
+ */
+interface ReplacementSnapshotExpectation {
+	promise: Promise<void>;
+	resolve: () => void;
+	reject: (error: Error) => void;
+}
+
 export const DAEMON_REFINE_REQUEST_TIMEOUT_MS = 10 * 60 * 1000;
 const DAEMON_LONG_RUNNING_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 export const DAEMON_RECONNECT_TIMEOUT_MS = 60_000;
@@ -275,6 +286,8 @@ export class DaemonAgentConnection implements AgentConnection {
 	private readonly completedSnapshots = new Map<string, DaemonSessionSnapshot>();
 	private readonly pendingReattachActiveSessionIds = new Set<string>();
 	private readonly snapshotRecoveryPromises = new Map<string, Promise<void>>();
+	/** Latest switch's not-yet-settled replacement snapshot wait; newer switches replace it. */
+	private pendingReplacementSnapshot: ReplacementSnapshotExpectation | undefined;
 	private readonly ignoredSnapshotIds = new Set<string>();
 	private rosterStore: AgentsViewRosterStore | undefined;
 	private reconnectPromise?: Promise<void>;
@@ -566,20 +579,23 @@ export class DaemonAgentConnection implements AgentConnection {
 				return this.latestSnapshot;
 			}
 		}
+		// A streamed snapshot for this session may still be in flight (for example
+		// the replacement a warm switch just triggered). Fetching the transcript
+		// now would race that stream and ship the full history again, so wait for
+		// it bounded and prefer the freshly applied snapshot when it lands.
+		await this.waitForPendingSessionSnapshot();
+		if (this.latestSnapshotIsFresh && this.latestSnapshot) {
+			return this.getInitialSnapshot(options);
+		}
 		// The session tree is intentionally not fetched here: it is large on long
 		// sessions and only needed when the user opens the tree/branch selector.
 		// getSessionTree() fetches it lazily via get_session_tree on first use.
 		const snapshotCursor = this.lastEventCursor;
 		const snapshotSequence = this.lastEventSequence;
 		const stateFreshnessGeneration = this.stateFreshnessGeneration;
-		const [state, messagesData, sessionContextData] = await Promise.all([
+		const [state, sessionContextData] = await Promise.all([
 			this.requestData<AgentConnectionState>(
 				{ type: "get_connection_state", activeSessionId: this.activeSessionId },
-				undefined,
-				options,
-			),
-			this.requestData<{ messages: AgentMessage[] }>(
-				{ type: "get_messages", activeSessionId: this.activeSessionId },
 				undefined,
 				options,
 			),
@@ -589,12 +605,30 @@ export class DaemonAgentConnection implements AgentConnection {
 				options,
 			),
 		]);
+		// get_session_context embeds the same transcript get_messages would
+		// return, so its messages are the snapshot transcript; only pay for the
+		// redundant second full-history frame when they are unexpectedly absent.
+		let sessionContext = sessionContextData.context;
+		let messages: AgentMessage[];
+		if (sessionContext && Array.isArray(sessionContext.messages)) {
+			messages = sessionContext.messages;
+		} else {
+			const messagesData = await this.requestData<{ messages: AgentMessage[] }>(
+				{ type: "get_messages", activeSessionId: this.activeSessionId },
+				undefined,
+				options,
+			);
+			messages = messagesData.messages;
+			if (sessionContext) {
+				sessionContext = { ...sessionContext, messages };
+			}
+		}
 		const children = this.latestSnapshot?.children;
 		const streamingMessage = this.latestSnapshot?.streamingMessage;
 		this.latestSnapshot = {
 			state,
-			messages: messagesData.messages,
-			sessionContext: sessionContextData.context,
+			messages,
+			sessionContext,
 			...(children ? { children } : {}),
 			...(streamingMessage ? { streamingMessage } : {}),
 		};
@@ -1497,14 +1531,27 @@ export class DaemonAgentConnection implements AgentConnection {
 		options?: AgentConnectionSwitchSessionOptions,
 	): Promise<{ cancelled: boolean }> {
 		const sourceActiveSessionId = this.activeSessionId;
+		// The daemon streams the replacement snapshot (session_replaced plus
+		// chunked frames) while this switch runs, so it can land before or after
+		// the response. Expect it before sending the command so either order is
+		// observed; awaiting it keeps the history crossing the wire once.
+		const expectation = this.expectReplacementSnapshot();
 		try {
-			return await this.requestData<{ cancelled: boolean }>({
+			const result = await this.requestData<{ cancelled: boolean }>({
 				type: "switch_session",
 				activeSessionId: sourceActiveSessionId,
 				sessionPath,
 				cwdOverride: options?.cwdOverride,
 			});
+			if (result.cancelled) {
+				// No replacement happened; a later unrelated one must not settle a stale wait.
+				this.failReplacementSnapshot(expectation, "Session switch was cancelled");
+				return result;
+			}
+			await this.awaitReplacementSnapshot(expectation);
+			return result;
 		} catch (error) {
+			this.failReplacementSnapshot(expectation, "Session switch failed");
 			if (!(error instanceof SessionAlreadyActiveError) || !error.activeSessionId) {
 				throw error;
 			}
@@ -1745,6 +1792,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			this.client.close();
 		}
 		this.rejectSnapshotAssemblies(new Error("Daemon connection disposed during snapshot transfer"));
+		this.failReplacementSnapshot(undefined, "Daemon connection disposed during a session switch");
 	}
 
 	async promoteToResident(): Promise<void> {
@@ -1931,6 +1979,17 @@ export class DaemonAgentConnection implements AgentConnection {
 		if (message.type === "session_snapshot_begin") {
 			const assembly = this.getSnapshotAssembly(message.snapshotId);
 			assembly.begin = message;
+			// A warm switch waits on exactly this streamed replacement snapshot.
+			// The resolve continuation runs after completeSnapshotAssembly applied
+			// the snapshot to the cache; any rejection settles the wait the other
+			// way so its caller falls back to refetching the transcript promptly.
+			const expectation = this.pendingReplacementSnapshot;
+			if (message.purpose === "replacement" && expectation) {
+				assembly.promise.then(
+					() => this.settleReplacementSnapshot(expectation),
+					(error: Error) => this.failReplacementSnapshot(expectation, error.message),
+				);
+			}
 			return;
 		}
 		if (message.type === "session_snapshot_chunk") {
@@ -2041,6 +2100,8 @@ export class DaemonAgentConnection implements AgentConnection {
 			this.latestSnapshot = latestSnapshot;
 			this.childRosterSequence = undefined;
 			this.latestSnapshotIsFresh = true;
+			// The inline snapshot is fully applied: a waiting switch can proceed.
+			this.settleReplacementSnapshot();
 			await this.emit({ type: "session_replaced", state: message.state, messages: message.messages });
 			return;
 		}
@@ -2316,6 +2377,87 @@ export class DaemonAgentConnection implements AgentConnection {
 		}
 	}
 
+	/**
+	 * Register the streamed replacement snapshot a switchSession call waits
+	 * on. The outbound session_replaced can arrive before or after the switch
+	 * response, so the expectation is registered before sending the command.
+	 */
+	private expectReplacementSnapshot(): ReplacementSnapshotExpectation {
+		// Rapid consecutive switches: the latest expectation wins and a stale
+		// one must never resolve the newer wait.
+		this.failReplacementSnapshot(undefined, "Session switch superseded by a newer switch");
+		let resolveExpectation!: () => void;
+		let rejectExpectation!: (error: Error) => void;
+		const promise = new Promise<void>((resolve, reject) => {
+			resolveExpectation = resolve;
+			rejectExpectation = reject;
+		});
+		// awaitReplacementSnapshot observes every settlement; rejections here
+		// must not surface as unhandled.
+		promise.catch(() => undefined);
+		const expectation: ReplacementSnapshotExpectation = {
+			promise,
+			resolve: resolveExpectation,
+			reject: rejectExpectation,
+		};
+		this.pendingReplacementSnapshot = expectation;
+		return expectation;
+	}
+
+	/** Settle the pending switch wait once the replacement snapshot is applied. */
+	private settleReplacementSnapshot(expectation?: ReplacementSnapshotExpectation): void {
+		const pending = this.pendingReplacementSnapshot;
+		if (!pending || (expectation && pending !== expectation)) return;
+		this.pendingReplacementSnapshot = undefined;
+		pending.resolve();
+	}
+
+	/** Reject the pending switch wait; a failed or ended switch must never be settled later. */
+	private failReplacementSnapshot(expectation: ReplacementSnapshotExpectation | undefined, reason: string): void {
+		const pending = this.pendingReplacementSnapshot;
+		if (!pending || (expectation && pending !== expectation)) return;
+		this.pendingReplacementSnapshot = undefined;
+		pending.reject(new Error(reason));
+	}
+
+	/** Bounded wait for the switch's replacement snapshot; any failure falls back to refetching. */
+	private async awaitReplacementSnapshot(expectation: ReplacementSnapshotExpectation): Promise<void> {
+		try {
+			await Promise.race([
+				expectation.promise,
+				new Promise<never>((_, rejectTimeout) => {
+					const timer = setTimeout(
+						() => rejectTimeout(new Error("Timed out waiting for the streamed session replacement snapshot")),
+						this.options.snapshotTimeoutMs ?? DAEMON_SNAPSHOT_TIMEOUT_MS,
+					);
+					timer.unref();
+				}),
+			]);
+		} catch {
+			// Timeout or a failed stream: return normally so getInitialSnapshot's
+			// fetch fallback reloads the transcript.
+		} finally {
+			this.failReplacementSnapshot(expectation, "Session switch wait ended");
+		}
+	}
+
+	/** Bounded wait for an in-flight streamed snapshot so the fetch path does not race it. */
+	private async waitForPendingSessionSnapshot(): Promise<void> {
+		const pending = [...this.snapshotAssemblies.values()].filter(
+			(assembly) =>
+				(assembly.begin?.purpose === "replacement" || assembly.begin?.purpose === "resync") &&
+				assembly.begin.activeSessionId === this.activeSessionId,
+		);
+		if (pending.length === 0) return;
+		await Promise.race([
+			Promise.allSettled(pending.map((assembly) => assembly.promise)),
+			new Promise<void>((resolveTimer) => {
+				const timer = setTimeout(resolveTimer, this.options.snapshotTimeoutMs ?? DAEMON_SNAPSHOT_TIMEOUT_MS);
+				timer.unref();
+			}),
+		]);
+	}
+
 	private applySessionSnapshot(snapshot: DaemonSessionSnapshot, replay?: DaemonReplayInfo): void {
 		this.dropDeferredSessionEventsThrough(snapshot.lastEventSequence, snapshot.lastEventCursor);
 		if (snapshot.lastEventCursor) {
@@ -2587,6 +2729,11 @@ function getDaemonMessageCursor(message: DaemonOutbound): DaemonEventCursor | un
 
 function invalidatesCachedSnapshot(commandType: DaemonCommandBody["type"]): boolean {
 	switch (commandType) {
+		// switch_session's replacement arrives as the streamed replacement
+		// snapshot (session_replaced plus chunked frames), which switchSession
+		// awaits; a cancelled switch changes nothing, so the response itself
+		// must not invalidate the cache and force a full-history refetch.
+		case "switch_session":
 		case "attach":
 		case "reattach":
 		case "detach":
@@ -2604,6 +2751,7 @@ function invalidatesCachedSnapshot(commandType: DaemonCommandBody["type"]): bool
 		case "heartbeats_list":
 		case "get_session_context":
 		case "get_session_tree":
+		case "get_context_tree":
 		case "get_user_messages_for_forking":
 		case "get_last_assistant_text":
 		case "get_system_prompt":
