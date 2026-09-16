@@ -62,8 +62,11 @@ function sessionsStatusLabel(summary: SessionSummary): string {
 	return summary.statusLabel ?? sessionRosterStatus(summary);
 }
 
-// Mirrors the agents-view status label minus statusLabel/lastHeardFromAt, which
-// have their own columns here, so the CLI and the TUI tell the same story.
+// Mirrors the agents-view status label branch by branch, minus statusLabel and
+// lastHeardFromAt (they get their own columns here). Two deliberate wording
+// drops: the heartbeat mark is just "heartbeat" (no countdown; the TUI has a
+// live next-run timer, this table does not), and the final idle fallback is
+// empty instead of "needs input" (the status column already says idle).
 function sessionActivityDetail(summary: SessionSummary): string {
 	if (summary.statusLabel === undefined && summary.workerState !== undefined && summary.workerState !== "ready") {
 		return summary.workerState;

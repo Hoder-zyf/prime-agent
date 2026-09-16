@@ -273,6 +273,68 @@ describe("formatSessionsTable", () => {
 			[["heartbeat-agent", "idle", "heartbeat", "2h", "", ""]],
 		);
 	});
+
+	it("mirrors the remaining activity detail branches of the agents-view label", () => {
+		expectTable(
+			[
+				makeSummary({
+					id: "action-agent",
+					activeSessionId: "active-action",
+					activity: "working",
+					sessionActions: {
+						queuedCount: 0,
+						steering: [],
+						followUps: [],
+						active: { kind: "session_command", phase: "running", label: "Sending to worker" },
+					},
+				}),
+				makeSummary({
+					id: "kind-agent",
+					activeSessionId: "active-kind",
+					activity: "working",
+					sessionActions: {
+						queuedCount: 0,
+						steering: [],
+						followUps: [],
+						active: { kind: "session_command", phase: "preparing" },
+					},
+				}),
+				makeSummary({
+					id: "queued-actions",
+					activeSessionId: "active-queued-actions",
+					activity: "idle",
+					sessionActions: { queuedCount: 2, steering: [], followUps: [] },
+				}),
+				makeSummary({
+					id: "starting-agent",
+					activeSessionId: "active-starting",
+					activity: "working",
+					workerState: "starting",
+				}),
+				makeSummary({
+					id: "stopping-agent",
+					activeSessionId: "active-stopping",
+					activity: "idle",
+					workerState: "stopping",
+				}),
+				makeSummary({
+					id: "replied-subagent",
+					activeSessionId: "active-replied",
+					activity: "idle",
+					runtimeKind: "subagent",
+					repliedSinceTask: true,
+				}),
+			],
+			[
+				["action-agent", "running", "Sending to worker", "2h", "", ""],
+				["kind-agent", "running", "session command", "2h", "", ""],
+				["starting-agent", "running", "starting", "2h", "", ""],
+				["queued-actions", "idle", "2 queued", "2h", "", ""],
+				["stopping-agent", "idle", "stopping", "2h", "", ""],
+				["replied-subagent", "idle", "replied", "2h", "", ""],
+			],
+		);
+	});
 });
 
 /** Assert the exact rendered table against the expected cell values. */
@@ -305,6 +367,9 @@ interface SummaryOptions {
 	diagnostics?: SessionSummary["diagnostics"];
 	modelFallbackMessage?: string;
 	hasActiveHeartbeat?: boolean;
+	sessionActions?: SessionSummary["sessionActions"];
+	runtimeKind?: SessionSummary["runtimeKind"];
+	repliedSinceTask?: boolean;
 	unnamed?: boolean;
 }
 
@@ -322,9 +387,11 @@ function makeSummary(options: SummaryOptions): SessionSummary {
 		isCompacting: options.compacting ?? false,
 		...(options.runningTools !== undefined ? { isRunningTools: options.runningTools } : {}),
 		...(options.bash !== undefined ? { isBashRunning: options.bash } : {}),
+		...(options.runtimeKind ? { runtimeKind: options.runtimeKind } : {}),
+		...(options.repliedSinceTask ? { repliedSinceTask: true } : {}),
 		attachedClients: 0,
 		messageCount: 2,
-		sessionActions: { queuedCount: 0, steering: [], followUps: [] },
+		sessionActions: options.sessionActions ?? { queuedCount: 0, steering: [], followUps: [] },
 		modified: options.modified ?? DEFAULT_MODIFIED,
 		...(options.statusLabel ? { statusLabel: options.statusLabel } : {}),
 		...(options.workerState ? { workerState: options.workerState } : {}),
