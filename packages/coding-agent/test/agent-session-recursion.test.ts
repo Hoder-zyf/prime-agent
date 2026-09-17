@@ -4524,30 +4524,37 @@ describe("AgentSession rlm recursion", () => {
 		releaseChild();
 	});
 
-	it("frees a deleted running child's name at the delete receipt", async () => {
+	/**
+	 * Gated stream fixture for the receipt-freedom tests: child shards answer only
+	 * when released, while the root's own turns (terminal child-exit notices)
+	 * answer immediately, so a notice turn can never wedge a quiescence wait
+	 * behind a gate nobody releases.
+	 */
+	function createNoticeFriendlyGatedStream() {
 		const releases: Array<() => void> = [];
 		const startedPrompts = new Set<string>();
-		const root = createSession({
-			streamFn: (_model, context) => {
-				const text = userText(context);
-				const stream = createAssistantMessageEventStream();
-				startedPrompts.add(text);
-				// The root answers its children's terminal notices immediately; only the
-				// gated child shards need explicit release, so a notice turn can never
-				// wedge quiescence behind a gate nobody releases.
-				const release = new Promise<void>((resolve) => {
-					if (text.startsWith("[child-exited:")) resolve();
-					else releases.push(resolve);
-				});
-				void release.then(() => {
-					stream.push({ type: "done", reason: "stop", message: assistantMessage(`child answer: ${text}`) });
-				});
-				return stream;
-			},
-		});
+		const streamFn: StreamFn = (_model, context) => {
+			const text = userText(context);
+			const stream = createAssistantMessageEventStream();
+			startedPrompts.add(text);
+			const release = new Promise<void>((resolve) => {
+				if (text.startsWith("[child-exited:")) resolve();
+				else releases.push(resolve);
+			});
+			void release.then(() => {
+				stream.push({ type: "done", reason: "stop", message: assistantMessage(`child answer: ${text}`) });
+			});
+			return stream;
+		};
+		return { releases, startedPrompts, streamFn };
+	}
+
+	it("frees a deleted running child's name at the delete receipt", async () => {
+		const gate = createNoticeFriendlyGatedStream();
+		const root = createSession({ streamFn: gate.streamFn });
 
 		const first = await root.runRlmChild("first shard", { name: "reusable-worker" });
-		await waitFor(() => startedPrompts.has("first shard"));
+		await waitFor(() => gate.startedPrompts.has("first shard"));
 		await expect(root.deleteRlmSubagent("reusable-worker")).resolves.toMatchObject({
 			subagent: { rlm_child_id: first.rlm_child_id },
 		});
@@ -4560,31 +4567,15 @@ describe("AgentSession rlm recursion", () => {
 		expect(replacement.rlm_child_id).not.toBe(first.rlm_child_id);
 		expect((await root.listRlmSubagents()).subagents.map((entry) => entry.session_name)).toEqual(["reusable-worker"]);
 
-		await waitFor(() => startedPrompts.has("replacement shard"));
-		for (const release of releases) release();
+		await waitFor(() => gate.startedPrompts.has("replacement shard"));
+		for (const release of gate.releases) release();
 		await root.waitForRlmQuiescence(AbortSignal.timeout(10_000));
 		expect((await root.listRlmSubagents()).subagents.map((entry) => entry.session_name)).toEqual(["reusable-worker"]);
 	});
 
 	it("admits a same-name respawn at the delete receipt while the daemon catalog still lists the child", async () => {
-		const releases: Array<() => void> = [];
-		const startedPrompts = new Set<string>();
-		const gatedStream: StreamFn = (_model, context) => {
-			const text = userText(context);
-			const stream = createAssistantMessageEventStream();
-			startedPrompts.add(text);
-			// The root answers its children's terminal notices immediately; only the
-			// gated shards need explicit release, so a notice turn can never wedge
-			// quiescence behind a gate nobody releases.
-			const release = new Promise<void>((resolve) => {
-				if (text.startsWith("[child-exited:")) resolve();
-				else releases.push(resolve);
-			});
-			void release.then(() => {
-				stream.push({ type: "done", reason: "stop", message: assistantMessage(`child answer: ${text}`) });
-			});
-			return stream;
-		};
+		const gate = createNoticeFriendlyGatedStream();
+		const gatedStream = gate.streamFn;
 
 		// The daemon unlists a child only when its runtime closes, and a delete
 		// receipt returns before the detached unwind gets there. Holding the
@@ -4654,7 +4645,7 @@ describe("AgentSession rlm recursion", () => {
 		internals.sessions.set(parentState.activeSessionId, parentState);
 
 		const first = await root.runRlmChild("first shard", { name: "reused-worker" });
-		await waitFor(() => startedPrompts.has("first shard"));
+		await waitFor(() => gate.startedPrompts.has("first shard"));
 		const childState = internals.sessions.get("child-active-1");
 		expect(childState?.runtime.session.sessionName).toBe("reused-worker");
 
@@ -4669,9 +4660,9 @@ describe("AgentSession rlm recursion", () => {
 		expect(replacement.name).toBe("reused-worker");
 		expect(replacement.rlm_child_id).not.toBe(first.rlm_child_id);
 
-		await waitFor(() => startedPrompts.has("replacement shard"));
+		await waitFor(() => gate.startedPrompts.has("replacement shard"));
 		releaseCleanup();
-		for (const release of releases) release();
+		for (const release of gate.releases) release();
 		await root.waitForRlmQuiescence(AbortSignal.timeout(10_000));
 		for (const hosted of hostedChildren) hosted.dispose();
 	});

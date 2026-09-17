@@ -1,7 +1,6 @@
 import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { setTimeout as sleep } from "node:timers/promises";
 import { Agent, type StreamFn } from "@earendil-works/pi-agent-core";
 import {
 	type AssistantMessage,
@@ -63,48 +62,61 @@ function streamAnswer(text: string): ReturnType<typeof createAssistantMessageEve
 	return stream;
 }
 
-async function waitForCondition(condition: () => boolean, timeoutMs: number): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
-	while (!condition()) {
-		if (Date.now() >= deadline) {
-			throw new Error("Timed out waiting for condition");
-		}
-		await sleep(10);
-	}
+/**
+ * Release every gated child answer, then wait for RLM quiescence: each listed
+ * run's detached unwind settles and leaves the run maps. The wait is bounded.
+ */
+async function settleRlmRuns(
+	gate: { releaseAll: () => void },
+	session: AgentSession,
+	timeoutMs = 10_000,
+): Promise<void> {
+	gate.releaseAll();
+	await session.waitForRlmQuiescence(AbortSignal.timeout(timeoutMs));
 }
 
 /**
- * Release every gated child answer until the listed runs leave the run maps
- * (their detached unwind settled). Every wait is bounded.
+ * Spawn the "first shard" generation under `name`, delete it, wait for the
+ * detached unwind to settle, and confirm its collectable tombstone envelope: the
+ * fixture every reused-name test starts from.
  */
-async function waitForRlmRunCleanup(
-	gate: { releaseAll: () => void },
-	session: AgentSession,
-	childIds: string[],
-	timeoutMs = 10_000,
-): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline && childIds.some((childId) => session.getRlmChildRunStatus(childId) !== undefined)) {
-		gate.releaseAll();
-		await sleep(20);
-	}
-	for (const childId of childIds) {
-		if (session.getRlmChildRunStatus(childId) !== undefined) {
-			throw new Error(`Timed out waiting for RLM child cleanup: ${childId}`);
-		}
-	}
+async function tombstoneFirstGeneration(
+	root: AgentSession,
+	gate: ReturnType<typeof createGatedStream>,
+	name: string,
+): Promise<{ rlm_child_id: string }> {
+	const first = await root.runRlmChild("first shard", { name });
+	await gate.started("first shard");
+	await root.deleteRlmSubagent(first.rlm_child_id);
+	await settleRlmRuns(gate, root);
+	expect((await root.collectRlmChildren([first.rlm_child_id], 0)).results[0]).toMatchObject({
+		rlm_child_id: first.rlm_child_id,
+		status: "cancelled",
+		settled: true,
+	});
+	return first;
 }
 
-/** Stream that answers only once its release promise resolves; each call gets its own gate. */
+/**
+ * Stream that answers only once its release promise resolves; each call gets its
+ * own gate. `started(text)` resolves as soon as the shard with that prompt text
+ * begins, so tests wait on a deterministic signal instead of polling.
+ */
 function createGatedStream() {
 	const releases: Array<() => void> = [];
 	const startedPrompts = new Set<string>();
+	const startedWaiters = new Map<string, Array<() => void>>();
 	const streamFn: StreamFn = (_model, context) => {
 		const text = userText(context).replace(/^\[task from parent\]\n\n/, "");
 		const stream = createAssistantMessageEventStream();
 		startedPrompts.add(text);
+		for (const resolve of startedWaiters.get(text) ?? []) resolve();
+		// The parent answers its children's terminal notices immediately; only the
+		// gated child shards need explicit release, so a notice turn can never
+		// wedge a quiescence wait behind a gate nobody releases.
 		const release = new Promise<void>((resolve) => {
-			releases.push(resolve);
+			if (text.startsWith("[child-exited:")) resolve();
+			else releases.push(resolve);
 		});
 		void release.then(() => {
 			stream.push({ type: "done", reason: "stop", message: assistantMessageLike(`child answer: ${text}`) });
@@ -113,8 +125,15 @@ function createGatedStream() {
 	};
 	return {
 		releases,
-		startedPrompts,
 		streamFn,
+		started: (text: string): Promise<void> =>
+			startedPrompts.has(text)
+				? Promise.resolve()
+				: new Promise<void>((resolve) => {
+						const waiters = startedWaiters.get(text) ?? [];
+						waiters.push(resolve);
+						startedWaiters.set(text, waiters);
+					}),
 		releaseAll: () =>
 			releases.forEach((release) => {
 				release();
@@ -179,6 +198,85 @@ describe("rlm.collect typed fan-in", () => {
 		});
 	}
 
+	/**
+	 * Agent-message controller stub whose daemon listing blocks on a gate once
+	 * held. The held listing can surface a passive child that conflicts with
+	 * `conflictingName`, which is how a delete preflight becomes observable.
+	 */
+	function createListingGateController(conflictingName?: string): {
+		agentMessageController: AgentSessionMessageController;
+		hold: () => void;
+		release: () => void;
+	} {
+		let holdListing = false;
+		let releaseListing!: () => void;
+		const listingGate = new Promise<void>((resolve) => {
+			releaseListing = resolve;
+		});
+		return {
+			agentMessageController: {
+				listAgents: async () => {
+					if (!holdListing) {
+						return { current: { activeSessionId: "parent-active", sessionId: "parent-session" }, agents: [] };
+					}
+					await listingGate;
+					return {
+						current: { activeSessionId: "parent-active", sessionId: "parent-session" },
+						agents: conflictingName
+							? [
+									{
+										activeSessionId: "passive-active",
+										sessionId: "passive-session",
+										sessionName: conflictingName,
+										runtimeKind: "subagent" as const,
+										cwd: tempDir,
+										isStreaming: false,
+										unfinishedActionCount: 0,
+										parentActiveSessionId: "parent-active",
+										rlmChildId: "passive-child",
+										sessionDir: join(tempDir, "passive-child"),
+									},
+								]
+							: [],
+					};
+				},
+				sendAgentMessage: async () => {
+					throw new Error("unexpected send");
+				},
+			},
+			hold: () => {
+				holdListing = true;
+			},
+			release: releaseListing,
+		};
+	}
+
+	/**
+	 * Child-session factory for a subagent runtime host. Hosted children are torn
+	 * down by their owning test, so the suite teardown keeps targeting the parent
+	 * session it owns instead.
+	 */
+	function createHostedChildFactory(gate: ReturnType<typeof createGatedStream>) {
+		const hostedChildren: AgentSession[] = [];
+		const makeHostedChild = (): AgentSession => {
+			const root = session;
+			const child = makeSession(gate.streamFn);
+			session = root;
+			hostedChildren.push(child);
+			return child;
+		};
+		return { hostedChildren, makeHostedChild };
+	}
+
+	/** Register a daemon-hydrated run-less child under `name`, as the daemon does. */
+	function registerRunlessChild(root: AgentSession, childId: string, name: string): AgentSession {
+		const retainedChild = makeSession(undefined, { rlmSessionDir: join(tempDir, childId) });
+		session = root;
+		retainedChild.setSessionName(name);
+		expect(root.registerRlmChildSession(childId, retainedChild)).toBe(true);
+		return retainedChild;
+	}
+
 	it("returns a typed envelope once the child settles", async () => {
 		session = makeSession();
 		const handle = await session.runRlmChild("compute the answer", { name: "worker-a" });
@@ -194,15 +292,20 @@ describe("rlm.collect typed fan-in", () => {
 		expect(entry.error).toBeUndefined();
 	});
 
-	it("collects every direct child when no targets are given", async () => {
+	it("collects every direct child when no targets are given and only the selected child when targeted", async () => {
 		session = makeSession();
 		const first = await session.runRlmChild("first task", { name: "worker-a" });
 		const second = await session.runRlmChild("second task", { name: "worker-b" });
 
-		const results = await session.collectRlmChildren([], 10_000);
-		const ids = results.results.map((entry) => entry.rlm_child_id).sort();
+		const all = await session.collectRlmChildren([], 10_000);
+		const ids = all.results.map((entry) => entry.rlm_child_id).sort();
 		expect(ids).toEqual([first.rlm_child_id, second.rlm_child_id].sort());
-		expect(results.results.every((entry) => entry.settled && entry.status === "done")).toBe(true);
+		expect(all.results.every((entry) => entry.settled && entry.status === "done")).toBe(true);
+
+		const targeted = await session.collectRlmChildren([first.rlm_child_id], 0);
+		expect(targeted.results.map((entry) => entry.rlm_child_id)).toEqual([first.rlm_child_id]);
+		const byName = await session.collectRlmChildren(["worker-b"], 0);
+		expect(byName.results.map((entry) => entry.rlm_child_id)).toEqual([second.rlm_child_id]);
 	});
 
 	it("re-collects a settled child after terminal cleanup", async () => {
@@ -227,18 +330,6 @@ describe("rlm.collect typed fan-in", () => {
 		expect(all.results.map((entry) => entry.rlm_child_id)).toContain(handle.rlm_child_id);
 	});
 
-	it("returns only the selected child from a targeted collect", async () => {
-		session = makeSession();
-		const first = await session.runRlmChild("first task", { name: "worker-a" });
-		const second = await session.runRlmChild("second task", { name: "worker-b" });
-		await session.collectRlmChildren([], 10_000);
-
-		const targeted = await session.collectRlmChildren([first.rlm_child_id], 0);
-		expect(targeted.results.map((entry) => entry.rlm_child_id)).toEqual([first.rlm_child_id]);
-		const byName = await session.collectRlmChildren(["worker-b"], 0);
-		expect(byName.results.map((entry) => entry.rlm_child_id)).toEqual([second.rlm_child_id]);
-	});
-
 	it("returns current snapshots on timeout without rejecting", async () => {
 		session = makeSession();
 		const handle = await session.runRlmChild("slow task", { name: "worker-a" });
@@ -254,7 +345,7 @@ describe("rlm.collect typed fan-in", () => {
 		const gate = createGatedStream();
 		session = makeSession(gate.streamFn);
 		const victim = await session.runRlmChild("victim shard", { name: "victim-worker" });
-		await waitForCondition(() => gate.startedPrompts.has("victim shard"), 10_000);
+		await gate.started("victim shard");
 
 		await session.deleteRlmSubagent(victim.rlm_child_id);
 
@@ -286,8 +377,7 @@ describe("rlm.collect typed fan-in", () => {
 			'No direct RLM child matches "no-such-child"',
 		);
 
-		gate.releaseAll();
-		await waitForCondition(() => session!.getRlmChildRunStatus(victim.rlm_child_id) === undefined, 10_000);
+		await settleRlmRuns(gate, session);
 	});
 
 	it("collects live and deleted targets together", async () => {
@@ -295,10 +385,7 @@ describe("rlm.collect typed fan-in", () => {
 		session = makeSession(gate.streamFn);
 		const live = await session.runRlmChild("live shard", { name: "live-worker" });
 		const victim = await session.runRlmChild("victim shard", { name: "victim-worker" });
-		await waitForCondition(
-			() => gate.startedPrompts.has("live shard") && gate.startedPrompts.has("victim shard"),
-			10_000,
-		);
+		await Promise.all([gate.started("live shard"), gate.started("victim shard")]);
 		await session.deleteRlmSubagent("victim-worker");
 
 		const results = await session.collectRlmChildren([live.rlm_child_id, victim.rlm_child_id], 0);
@@ -310,20 +397,14 @@ describe("rlm.collect typed fan-in", () => {
 			error: "Deleted by parent orchestrator",
 		});
 
-		gate.releaseAll();
-		await waitForCondition(
-			() =>
-				session!.getRlmChildRunStatus(victim.rlm_child_id) === undefined &&
-				session!.getRlmChildRunStatus(live.rlm_child_id) === undefined,
-			10_000,
-		);
+		await settleRlmRuns(gate, session);
 	});
 
 	it("throws ambiguity when a deleted selector matches several detached runs", async () => {
 		const gate = createGatedStream();
 		session = makeSession(gate.streamFn);
 		const first = await session.runRlmChild("first shard", { name: "reused-worker" });
-		await waitForCondition(() => gate.startedPrompts.has("first shard"), 10_000);
+		await gate.started("first shard");
 
 		// A delete receipt frees the name, so a reused selector can race two
 		// accepted deletes whose detached unwinds are still pending. The second
@@ -369,56 +450,21 @@ describe("rlm.collect typed fan-in", () => {
 		// These are deliberately minimal lifecycle records; remove the injected
 		// run before fixture teardown asks real runs to settle.
 		internals._activeRlmChildRuns.delete("injected-deleted-run");
-		gate.releaseAll();
-		await waitForCondition(() => session!.getRlmChildRunStatus(first.rlm_child_id) === undefined, 10_000);
+		await settleRlmRuns(gate, session);
 	});
 
 	it("does not report a settled cancellation while a delete preflight can still fail", async () => {
 		const gate = createGatedStream();
-		let holdListing = false;
-		let releaseListing!: () => void;
-		const listingGate = new Promise<void>((resolve) => {
-			releaseListing = resolve;
-		});
+		const listing = createListingGateController("victim-worker");
 		session = makeSession(gate.streamFn, {
-			agentMessageController: {
-				listAgents: async () => {
-					if (!holdListing) {
-						return {
-							current: { activeSessionId: "parent-active", sessionId: "parent-session" },
-							agents: [],
-						};
-					}
-					await listingGate;
-					return {
-						current: { activeSessionId: "parent-active", sessionId: "parent-session" },
-						agents: [
-							{
-								activeSessionId: "passive-active",
-								sessionId: "passive-session",
-								sessionName: "victim-worker",
-								runtimeKind: "subagent" as const,
-								cwd: tempDir,
-								isStreaming: false,
-								unfinishedActionCount: 0,
-								parentActiveSessionId: "parent-active",
-								rlmChildId: "passive-child",
-								sessionDir: join(tempDir, "passive-child"),
-							},
-						],
-					};
-				},
-				sendAgentMessage: async () => {
-					throw new Error("unexpected send");
-				},
-			},
+			agentMessageController: listing.agentMessageController,
 		});
 		const victim = await session.runRlmChild("victim shard", { name: "victim-worker" });
-		await waitForCondition(() => gate.startedPrompts.has("victim shard"), 10_000);
+		await gate.started("victim shard");
 
 		// The delete reserves the run synchronously, then blocks on the daemon
 		// listing preflight that will find a conflicting passive selector.
-		holdListing = true;
+		listing.hold();
 		const deleting = session.deleteRlmSubagent("victim-worker");
 		// Mid-preflight the delete can still fail, so collect must not answer
 		// with a settled cancelled envelope; the reserved run is simply hidden.
@@ -426,7 +472,7 @@ describe("rlm.collect typed fan-in", () => {
 			'No direct RLM child matches "victim-worker" in the current parent session',
 		);
 
-		releaseListing();
+		listing.release();
 		await expect(deleting).rejects.toThrow(
 			'RLM subagent selector "victim-worker" is ambiguous in the current parent session',
 		);
@@ -453,21 +499,8 @@ describe("rlm.collect typed fan-in", () => {
 		const cleanupGate = new Promise<void>((resolve) => {
 			releaseCleanup = resolve;
 		});
-		let holdListing = false;
-		let releaseListing!: () => void;
-		const listingGate = new Promise<void>((resolve) => {
-			releaseListing = resolve;
-		});
-		const hostedChildren: AgentSession[] = [];
-		const makeHostedChild = (): AgentSession => {
-			const root = session;
-			const child = makeSession(gate.streamFn);
-			// Hosted children are torn down by this test, so the suite teardown keeps
-			// targeting the parent it owns.
-			session = root;
-			hostedChildren.push(child);
-			return child;
-		};
+		const listing = createListingGateController("reused-worker");
+		const { hostedChildren, makeHostedChild } = createHostedChildFactory(gate);
 		const root = makeSession(gate.streamFn, {
 			subagentRuntimeHost: {
 				createRlmSubagentRuntime: async () => ({ session: makeHostedChild() }),
@@ -475,52 +508,22 @@ describe("rlm.collect typed fan-in", () => {
 					await cleanupGate;
 				},
 			},
-			agentMessageController: {
-				listAgents: async () => {
-					if (!holdListing) {
-						return {
-							current: { activeSessionId: "parent-active", sessionId: "parent-session" },
-							agents: [],
-						};
-					}
-					await listingGate;
-					return {
-						current: { activeSessionId: "parent-active", sessionId: "parent-session" },
-						agents: [
-							{
-								activeSessionId: "passive-active",
-								sessionId: "passive-session",
-								sessionName: "reused-worker",
-								runtimeKind: "subagent" as const,
-								cwd: tempDir,
-								isStreaming: false,
-								unfinishedActionCount: 0,
-								parentActiveSessionId: "parent-active",
-								rlmChildId: "passive-child",
-								sessionDir: join(tempDir, "passive-child"),
-							},
-						],
-					};
-				},
-				sendAgentMessage: async () => {
-					throw new Error("unexpected send");
-				},
-			},
+			agentMessageController: listing.agentMessageController,
 		});
 
 		const first = await root.runRlmChild("first shard", { name: "reused-worker" });
-		await waitForCondition(() => gate.startedPrompts.has("first shard"), 10_000);
+		await gate.started("first shard");
 		// The delete receipt frees the name while the first generation still unwinds.
 		await root.deleteRlmSubagent(first.rlm_child_id);
 		const replacement = await root.runRlmChild("replacement shard", { name: "reused-worker" });
 		expect(replacement.rlm_child_id).not.toBe(first.rlm_child_id);
-		await waitForCondition(() => gate.startedPrompts.has("replacement shard"), 10_000);
+		await gate.started("replacement shard");
 
 		// The replacement is reserved but still inside its delete preflight, which can
 		// fail and leave the replacement running. The previous generation's accepted
 		// delete matches the same reused name, so the deleted fallback must not answer
 		// the selector with that stale cancelled envelope.
-		holdListing = true;
+		listing.hold();
 		const deleting = root.deleteRlmSubagent(replacement.rlm_child_id);
 		await expect(root.collectRlmChildren(["reused-worker"], 0)).rejects.toThrow(
 			'No direct RLM child matches "reused-worker" in the current parent session',
@@ -530,7 +533,7 @@ describe("rlm.collect typed fan-in", () => {
 			'No direct RLM child matches "',
 		);
 
-		releaseListing();
+		listing.release();
 		await expect(deleting).resolves.toMatchObject({
 			subagent: { rlm_child_id: replacement.rlm_child_id },
 		});
@@ -560,7 +563,7 @@ describe("rlm.collect typed fan-in", () => {
 		// Both generations unwind once their cleanup and their gated shards are
 		// released; every wait is bounded.
 		releaseCleanup();
-		await waitForRlmRunCleanup(gate, root, [first.rlm_child_id, replacement.rlm_child_id]);
+		await settleRlmRuns(gate, root);
 		expect(root.getRlmChildRunStatus(first.rlm_child_id)).toBeUndefined();
 		expect(root.getRlmChildRunStatus(replacement.rlm_child_id)).toBeUndefined();
 		for (const hosted of hostedChildren) hosted.dispose();
@@ -570,7 +573,7 @@ describe("rlm.collect typed fan-in", () => {
 		const gate = createGatedStream();
 		session = makeSession(gate.streamFn);
 		const victim = await session.runRlmChild("victim shard", { name: "victim-worker" });
-		await waitForCondition(() => gate.startedPrompts.has("victim shard"), 10_000);
+		await gate.started("victim shard");
 		await session.deleteRlmSubagent(victim.rlm_child_id);
 
 		// Mid-unwind the run is still in the lookup maps, so collect reads it there.
@@ -579,7 +582,7 @@ describe("rlm.collect typed fan-in", () => {
 
 		// Once the unwind settles the run leaves both maps. The delete receipt still
 		// promises a cancelled envelope, so collect must answer from the tombstone.
-		await waitForRlmRunCleanup(gate, session, [victim.rlm_child_id]);
+		await settleRlmRuns(gate, session);
 		expect(session.getRlmChildRunStatus(victim.rlm_child_id)).toBeUndefined();
 		const byId = await session.collectRlmChildren([victim.rlm_child_id], 0);
 		expect(byId.results).toHaveLength(1);
@@ -604,71 +607,27 @@ describe("rlm.collect typed fan-in", () => {
 
 	it("keeps a tombstoned generation off a reused name that is mid-delete-preflight", async () => {
 		const gate = createGatedStream();
-		let holdListing = false;
-		let releaseListing!: () => void;
-		const listingGate = new Promise<void>((resolve) => {
-			releaseListing = resolve;
-		});
+		const listing = createListingGateController("reused-worker");
 		session = makeSession(gate.streamFn, {
-			agentMessageController: {
-				listAgents: async () => {
-					if (!holdListing) {
-						return {
-							current: { activeSessionId: "parent-active", sessionId: "parent-session" },
-							agents: [],
-						};
-					}
-					await listingGate;
-					return {
-						current: { activeSessionId: "parent-active", sessionId: "parent-session" },
-						agents: [
-							{
-								activeSessionId: "passive-active",
-								sessionId: "passive-session",
-								sessionName: "reused-worker",
-								runtimeKind: "subagent" as const,
-								cwd: tempDir,
-								isStreaming: false,
-								unfinishedActionCount: 0,
-								parentActiveSessionId: "parent-active",
-								rlmChildId: "passive-child",
-								sessionDir: join(tempDir, "passive-child"),
-							},
-						],
-					};
-				},
-				sendAgentMessage: async () => {
-					throw new Error("unexpected send");
-				},
-			},
+			agentMessageController: listing.agentMessageController,
 		});
 
-		const first = await session.runRlmChild("first shard", { name: "reused-worker" });
-		await waitForCondition(() => gate.startedPrompts.has("first shard"), 10_000);
-		await session.deleteRlmSubagent(first.rlm_child_id);
-		await waitForRlmRunCleanup(gate, session, [first.rlm_child_id]);
-		// The unwound generation survives only as a collectable tombstone.
-		const tombstone = await session.collectRlmChildren([first.rlm_child_id], 0);
-		expect(tombstone.results[0]).toMatchObject({
-			rlm_child_id: first.rlm_child_id,
-			status: "cancelled",
-			settled: true,
-		});
+		const first = await tombstoneFirstGeneration(session, gate, "reused-worker");
 
 		const replacement = await session.runRlmChild("replacement shard", { name: "reused-worker" });
 		expect(replacement.rlm_child_id).not.toBe(first.rlm_child_id);
-		await waitForCondition(() => gate.startedPrompts.has("replacement shard"), 10_000);
+		await gate.started("replacement shard");
 
 		// The replacement is reserved but still inside its delete preflight, so that
 		// delete can still fail and leave a live run under the reused name. The
 		// selector must report no match instead of the tombstoned generation.
-		holdListing = true;
+		listing.hold();
 		const deleting = session.deleteRlmSubagent(replacement.rlm_child_id);
 		await expect(session.collectRlmChildren(["reused-worker"], 0)).rejects.toThrow(
 			'No direct RLM child matches "reused-worker" in the current parent session',
 		);
 
-		releaseListing();
+		listing.release();
 		await expect(deleting).resolves.toMatchObject({
 			subagent: { rlm_child_id: replacement.rlm_child_id },
 		});
@@ -685,7 +644,7 @@ describe("rlm.collect typed fan-in", () => {
 			settled: true,
 		});
 
-		await waitForRlmRunCleanup(gate, session, [replacement.rlm_child_id]);
+		await settleRlmRuns(gate, session);
 		expect(session.getRlmChildRunStatus(replacement.rlm_child_id)).toBeUndefined();
 	});
 
@@ -694,15 +653,15 @@ describe("rlm.collect typed fan-in", () => {
 		session = makeSession(gate.streamFn);
 
 		const first = await session.runRlmChild("first shard", { name: "reused-worker" });
-		await waitForCondition(() => gate.startedPrompts.has("first shard"), 10_000);
+		await gate.started("first shard");
 		await session.deleteRlmSubagent("reused-worker");
-		await waitForRlmRunCleanup(gate, session, [first.rlm_child_id]);
+		await settleRlmRuns(gate, session);
 
 		const second = await session.runRlmChild("second shard", { name: "reused-worker" });
 		expect(second.rlm_child_id).not.toBe(first.rlm_child_id);
-		await waitForCondition(() => gate.startedPrompts.has("second shard"), 10_000);
+		await gate.started("second shard");
 		await session.deleteRlmSubagent("reused-worker");
-		await waitForRlmRunCleanup(gate, session, [second.rlm_child_id]);
+		await settleRlmRuns(gate, session);
 
 		// Both generations are unwound tombstones under one reused name, so the name
 		// is ambiguous exactly like two detached runs racing the same selector.
@@ -734,7 +693,7 @@ describe("rlm.collect typed fan-in", () => {
 		const done = await session.runRlmChild("done shard", { name: "done-worker" });
 		// Terminal cleanup moves the settled run out of the active map and keeps the
 		// child retained, so the delete takes the no-active-run path.
-		await waitForCondition(() => session!.getRlmChildRunStatus(done.rlm_child_id) === undefined, 10_000);
+		await session.waitForRlmQuiescence(AbortSignal.timeout(10_000));
 		const settled = await session.collectRlmChildren([done.rlm_child_id], 10_000);
 		expect(settled.results[0]).toMatchObject({ status: "done", settled: true });
 
@@ -765,12 +724,7 @@ describe("rlm.collect typed fan-in", () => {
 		const root = makeSession();
 		// The daemon registers hydrated passive children without a run, so the
 		// tombstone has to carry the registry identity instead.
-		const retainedChild = makeSession(undefined, {
-			rlmSessionDir: join(tempDir, "runless-retained"),
-		});
-		session = root;
-		retainedChild.setSessionName("runless-worker");
-		expect(root.registerRlmChildSession("runless-child", retainedChild)).toBe(true);
+		const retainedChild = registerRunlessChild(root, "runless-child", "runless-worker");
 
 		await expect(root.deleteRlmSubagent("runless-worker")).resolves.toMatchObject({
 			subagent: { rlm_child_id: "runless-child" },
@@ -802,54 +756,19 @@ describe("rlm.collect typed fan-in", () => {
 
 	it("keeps a run-less delete reservation off the previous generation's cancelled envelope", async () => {
 		const gate = createGatedStream();
-		let holdListing = false;
-		let releaseListing!: () => void;
-		const listingGate = new Promise<void>((resolve) => {
-			releaseListing = resolve;
-		});
+		const listing = createListingGateController();
 		const root = makeSession(gate.streamFn, {
-			agentMessageController: {
-				listAgents: async () => {
-					if (!holdListing) {
-						return {
-							current: { activeSessionId: "parent-active", sessionId: "parent-session" },
-							agents: [],
-						};
-					}
-					await listingGate;
-					return {
-						current: { activeSessionId: "parent-active", sessionId: "parent-session" },
-						agents: [],
-					};
-				},
-				sendAgentMessage: async () => {
-					throw new Error("unexpected send");
-				},
-			},
+			agentMessageController: listing.agentMessageController,
 		});
 		session = root;
 
-		const first = await root.runRlmChild("first shard", { name: "reused-worker" });
-		await waitForCondition(() => gate.startedPrompts.has("first shard"), 10_000);
-		await root.deleteRlmSubagent(first.rlm_child_id);
-		await waitForRlmRunCleanup(gate, root, [first.rlm_child_id]);
-		// The unwound generation is only a tombstone now, still matching the name.
-		expect((await root.collectRlmChildren([first.rlm_child_id], 0)).results[0]).toMatchObject({
-			rlm_child_id: first.rlm_child_id,
-			status: "cancelled",
-			settled: true,
-		});
+		await tombstoneFirstGeneration(root, gate, "reused-worker");
 
 		// A run-less retained child reuses that name: candidates never see it, so its
 		// reservation is the only mid-preflight signal.
-		const retainedChild = makeSession(undefined, {
-			rlmSessionDir: join(tempDir, "runless-pending"),
-		});
-		session = root;
-		retainedChild.setSessionName("reused-worker");
-		expect(root.registerRlmChildSession("runless-pending", retainedChild)).toBe(true);
+		registerRunlessChild(root, "runless-pending", "reused-worker");
 
-		holdListing = true;
+		listing.hold();
 		const deleting = root.deleteRlmSubagent("reused-worker");
 		// The run-less delete is undecided, so the reused selector must report no match
 		// instead of the previous generation's tombstoned envelope.
@@ -857,7 +776,7 @@ describe("rlm.collect typed fan-in", () => {
 			'No direct RLM child matches "reused-worker" in the current parent session',
 		);
 
-		releaseListing();
+		listing.release();
 		await expect(deleting).resolves.toMatchObject({
 			subagent: { rlm_child_id: "runless-pending" },
 		});
@@ -882,25 +801,11 @@ describe("rlm.collect typed fan-in", () => {
 		const root = makeSession(gate.streamFn);
 		session = root;
 
-		const first = await root.runRlmChild("first shard", { name: "reused-worker" });
-		await waitForCondition(() => gate.startedPrompts.has("first shard"), 10_000);
-		await root.deleteRlmSubagent(first.rlm_child_id);
-		await waitForRlmRunCleanup(gate, root, [first.rlm_child_id]);
-		// The unwound generation is only a tombstone now, still matching the name.
-		expect((await root.collectRlmChildren([first.rlm_child_id], 0)).results[0]).toMatchObject({
-			rlm_child_id: first.rlm_child_id,
-			status: "cancelled",
-			settled: true,
-		});
+		const first = await tombstoneFirstGeneration(root, gate, "reused-worker");
 
 		// A live run-less retained child reuses the name: candidates never see it,
 		// so it must own the selector instead of the deleted generation's envelope.
-		const retainedChild = makeSession(undefined, {
-			rlmSessionDir: join(tempDir, "runless-live"),
-		});
-		session = root;
-		retainedChild.setSessionName("reused-worker");
-		expect(root.registerRlmChildSession("runless-live", retainedChild)).toBe(true);
+		registerRunlessChild(root, "runless-live", "reused-worker");
 
 		await expect(root.collectRlmChildren(["reused-worker"], 0)).rejects.toThrow(
 			'No direct RLM child matches "reused-worker" in the current parent session',
@@ -939,14 +844,7 @@ describe("rlm.collect typed fan-in", () => {
 	// generation's tombstone from answering the selector.
 	it("keeps a failed-cleanup run-less replacement off the deleted generation's cancelled envelope", async () => {
 		const gate = createGatedStream();
-		const hostedChildren: AgentSession[] = [];
-		const makeHostedChild = (): AgentSession => {
-			const root = session;
-			const child = makeSession(gate.streamFn);
-			session = root;
-			hostedChildren.push(child);
-			return child;
-		};
+		const { hostedChildren, makeHostedChild } = createHostedChildFactory(gate);
 		const root = makeSession(gate.streamFn, {
 			subagentRuntimeHost: {
 				createRlmSubagentRuntime: async () => ({ session: makeHostedChild() }),
@@ -959,23 +857,10 @@ describe("rlm.collect typed fan-in", () => {
 		});
 		session = root;
 
-		const first = await root.runRlmChild("first shard", { name: "reused-worker" });
-		await waitForCondition(() => gate.startedPrompts.has("first shard"), 10_000);
-		await root.deleteRlmSubagent(first.rlm_child_id);
-		await waitForRlmRunCleanup(gate, root, [first.rlm_child_id]);
-		expect((await root.collectRlmChildren([first.rlm_child_id], 0)).results[0]).toMatchObject({
-			rlm_child_id: first.rlm_child_id,
-			status: "cancelled",
-			settled: true,
-		});
+		const first = await tombstoneFirstGeneration(root, gate, "reused-worker");
 
 		// A run-less retained child reuses the name, then its delete throws.
-		const retainedChild = makeSession(undefined, {
-			rlmSessionDir: join(tempDir, "runless-failed"),
-		});
-		session = root;
-		retainedChild.setSessionName("reused-worker");
-		expect(root.registerRlmChildSession("runless-failed", retainedChild)).toBe(true);
+		registerRunlessChild(root, "runless-failed", "reused-worker");
 		await expect(root.deleteRlmSubagent("reused-worker")).rejects.toThrow("injected cleanup failure");
 
 		// The replacement still owns the name: a same-name spawn stays blocked.
