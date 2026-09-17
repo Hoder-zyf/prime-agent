@@ -2434,8 +2434,11 @@ export class DaemonAgentConnection implements AgentConnection {
 				}),
 			]);
 		} catch {
-			// Timeout or a failed stream: return normally so getInitialSnapshot's
-			// fetch fallback reloads the transcript.
+			// Timeout or a failed stream: no replacement was applied, so a cached
+			// pre-switch snapshot must not stay fresh or the next
+			// getInitialSnapshot would serve the previous session's transcript.
+			// Invalidate it so the fetch fallback reloads the switched session.
+			this.latestSnapshotIsFresh = false;
 		} finally {
 			this.failReplacementSnapshot(expectation, "Session switch wait ended");
 		}

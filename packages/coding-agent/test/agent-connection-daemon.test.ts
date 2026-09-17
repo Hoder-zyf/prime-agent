@@ -2329,6 +2329,40 @@ describe("DaemonAgentConnection", () => {
 		await connection.dispose();
 	});
 
+	it("#2399: refetches the switched session when the replacement snapshot never arrives", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.connectionStateFactory = (activeSessionId) =>
+			createConnectionState(activeSessionId, "session-switched");
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1", {
+			snapshotTimeoutMs: 10,
+		});
+		await connection.attach();
+		const request = fakeClient.request.bind(fakeClient);
+		vi.spyOn(fakeClient, "request").mockImplementation(async (command, ...options) => {
+			if (command.type !== "switch_session") return request(command, ...options);
+			fakeClient.requests.push(command);
+			// The daemon accepts the switch but never streams a replacement snapshot.
+			return { type: "response", command: command.type, success: true, data: { cancelled: false } };
+		});
+		fakeClient.requests.length = 0;
+
+		// The bounded wait ends without a replacement, so the switch still returns.
+		await expect(connection.switchSession("/tmp/target.jsonl")).resolves.toEqual({ cancelled: false });
+		expect(fakeClient.requests.map((request) => request.type)).toEqual(["switch_session"]);
+		// The stale pre-switch cache must never be served as the switched session.
+		const snapshot = await connection.getInitialSnapshot();
+		expect(snapshot).toMatchObject({
+			state: { sessionId: "session-switched" },
+			messages: [{ role: "user", content: "context prompt", timestamp: 3 }],
+		});
+		expect(fakeClient.requests.map((request) => request.type)).toEqual([
+			"switch_session",
+			"get_connection_state",
+			"get_session_context",
+		]);
+		await connection.dispose();
+	});
+
 	it("#2399: fetches get_messages only when the fallback context lacks embedded messages", async () => {
 		const fakeClient = new FakeDaemonClient();
 		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
