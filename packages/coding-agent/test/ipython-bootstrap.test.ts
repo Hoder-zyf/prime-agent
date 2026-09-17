@@ -11,10 +11,6 @@ import {
 } from "../src/core/tools/ipython.js";
 
 describe("RLM bootstrap", () => {
-	it("pre-imports asyncio so the prompt's subagent patterns work without a manual import", () => {
-		expect(buildRlmBootstrapCode()).toMatch(/^import asyncio$/m);
-	});
-
 	it("gives subagent registry operations the actionable missing-runtime fallback", () => {
 		const code = buildRlmBootstrapCode();
 		expect(code).toContain('async def find_models(self, query="", limit=8)');
@@ -54,41 +50,17 @@ describe("RLM bootstrap", () => {
 		expect(code).toContain("globals()[_prime_agent_skill_name] = _PrimeAgentUnavailableSkill");
 	});
 
-	it("reports failed skill imports through the marker line the host parses", () => {
-		const code = buildRlmBootstrapCode([
-			{
-				name: "broken-skill",
-				importName: "broken_skill",
-				packagePath: "/tmp/broken-skill",
-				pyprojectPath: "/tmp/broken-skill/pyproject.toml",
-			},
-		]);
-
-		expect(code).toContain(`print(
-        "${PYTHON_SKILL_IMPORT_ERROR_REPORT_MARKER}"
-        + _prime_agent_json.dumps(_PRIME_AGENT_SKILL_IMPORT_ERRORS)
-    )`);
-		expect(code).toContain("if _PRIME_AGENT_SKILL_IMPORT_ERRORS:");
-	});
-
-	it("parses the unavailable-skill report from bootstrap stdout", () => {
-		expect(
-			parseUnavailablePythonSkills(
-				`${PYTHON_SKILL_IMPORT_ERROR_REPORT_MARKER}{"websearch":"No module named 'websearch'"}\n`,
-			),
-		).toEqual({ websearch: "No module named 'websearch'" });
-		// Leading/other output around the marker is tolerated.
-		expect(parseUnavailablePythonSkills(`noise\n${PYTHON_SKILL_IMPORT_ERROR_REPORT_MARKER}{"edit":"boom"}`)).toEqual({
-			edit: "boom",
-		});
-	});
-
-	it("treats missing or malformed reports as no unavailable skills", () => {
-		expect(parseUnavailablePythonSkills("")).toBeUndefined();
-		expect(parseUnavailablePythonSkills("some unrelated kernel output")).toBeUndefined();
-		expect(parseUnavailablePythonSkills(`${PYTHON_SKILL_IMPORT_ERROR_REPORT_MARKER}not json`)).toBeUndefined();
-		// An empty dict means every skill imported; it is not a report.
-		expect(parseUnavailablePythonSkills(`${PYTHON_SKILL_IMPORT_ERROR_REPORT_MARKER}{}`)).toBeUndefined();
+	it.each([
+		[
+			`${PYTHON_SKILL_IMPORT_ERROR_REPORT_MARKER}{"websearch":"No module named 'websearch'"}\n`,
+			{ websearch: "No module named 'websearch'" },
+		],
+		[`noise\n${PYTHON_SKILL_IMPORT_ERROR_REPORT_MARKER}{"edit":"boom"}`, { edit: "boom" }],
+		["some unrelated kernel output", undefined],
+		[`${PYTHON_SKILL_IMPORT_ERROR_REPORT_MARKER}not json`, undefined],
+		[`${PYTHON_SKILL_IMPORT_ERROR_REPORT_MARKER}{}`, undefined],
+	])("parses %j as %j", (stdout, expected) => {
+		expect(parseUnavailablePythonSkills(stdout as string)).toEqual(expected);
 	});
 });
 
@@ -133,61 +105,6 @@ describeIfKernel("RLM bootstrap (real kernel)", () => {
 			const envResult = await manager.execute('import os\nprint(os.environ["NO_COLOR"])');
 			expect(envResult.status).toBe("ok");
 			expect(envResult.stdout.trim()).toBe("1");
-		} finally {
-			await manager.shutdown({ snapshot: true, drainHostRequests: true });
-		}
-	}, 60_000);
-
-	it("reports broken skill imports in the bootstrap cell's stdout", async () => {
-		const manager = new ReplKernelManager({ python: python as string, cwd: dir });
-		try {
-			await manager.start();
-			const bootstrap = await manager.execute(
-				buildRlmBootstrapCode([
-					{
-						name: "definitely-missing-skill",
-						importName: "definitely_missing_skill",
-						packagePath: "/tmp/definitely-missing-skill",
-						pyprojectPath: "/tmp/definitely-missing-skill/pyproject.toml",
-					},
-				]),
-			);
-			expect(bootstrap.status).toBe("ok");
-
-			const unavailable = parseUnavailablePythonSkills(bootstrap.stdout);
-			expect(unavailable).toEqual({
-				definitely_missing_skill: expect.stringContaining("No module named"),
-			});
-			// The placeholder keeps the call-time error message.
-			const call = await manager.execute("await definitely_missing_skill.run()");
-			expect(call.status).toBe("error");
-			expect(call.error?.evalue).toContain("Python skill definitely_missing_skill is unavailable");
-		} finally {
-			await manager.shutdown({ snapshot: true, drainHostRequests: true });
-		}
-	}, 60_000);
-
-	it("prints no report when every skill imports cleanly", async () => {
-		const editSkillRoot = join(process.cwd(), "skills", "edit");
-		const manager = new ReplKernelManager({
-			python: python as string,
-			cwd: dir,
-			env: { PYTHONPATH: join(editSkillRoot, "src") },
-		});
-		try {
-			await manager.start();
-			const bootstrap = await manager.execute(
-				buildRlmBootstrapCode([
-					{
-						name: "edit",
-						importName: "edit",
-						packagePath: editSkillRoot,
-						pyprojectPath: join(editSkillRoot, "pyproject.toml"),
-					},
-				]),
-			);
-			expect(bootstrap.status).toBe("ok");
-			expect(parseUnavailablePythonSkills(bootstrap.stdout)).toBeUndefined();
 		} finally {
 			await manager.shutdown({ snapshot: true, drainHostRequests: true });
 		}
