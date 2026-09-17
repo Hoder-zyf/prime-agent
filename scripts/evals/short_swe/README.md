@@ -61,8 +61,11 @@ Reapply the label to approve the new exact comparison.
   each task image, so scoring does not resolve packages from the network. A fixed gold-patch oracle must resolve
   before any paired task starts. Missing or inconsistent verifier output fails as infrastructure
   rather than becoming a zero reward.
-- There is no durable baseline, promotion job, focused confirmation, or automatic
+- There is no durable gating baseline, promotion job, focused confirmation, or automatic
   retry. The one run compares head directly with its exact base and never merges.
+  `harness-baselines.json` holds static reference results for other coding harnesses on
+  the same suite; the report renders them as context only, unmeasured rows read as not
+  yet measured, and they never affect the verdict.
 
 ## Gate
 

@@ -546,6 +546,135 @@ def test_report_fails_drastic_quality_or_efficiency_regression() -> None:
     assert "Cumulative task time reached 2.00x base without more resolutions." in markdown
 
 
+def test_harness_baselines_file_holds_the_pinned_schema() -> None:
+    document = json.loads((EVAL_ROOT / "harness-baselines.json").read_text())
+    assert document["schema_version"] == 1
+    assert document["description"] == "Static harness baselines on the 28-task Short SWE suite"
+    assert isinstance(document["model"], str) and document["model"]
+    assert [entry["harness"] for entry in document["baselines"]] == list(report.HARNESS_LABELS)
+    report.validate_baselines(document)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda document: document.update(schema_version=2),
+        lambda document: document.update(description=""),
+        lambda document: document.update(model=""),
+        lambda document: document.update(baselines={}),
+        lambda document: document["baselines"].pop(),
+        lambda document: document["baselines"].append(dict(document["baselines"][0])),
+        lambda document: document["baselines"][0].update(harness="unrelated-harness"),
+        lambda document: document["baselines"][0].update(resolved=29),
+        lambda document: document["baselines"][0].update(resolved=-1),
+        lambda document: document["baselines"][0].update(resolved=True),
+        lambda document: document["baselines"][0].update(model_failures=29),
+        lambda document: document["baselines"][0].update(uncached_input_tokens=-1),
+        lambda document: document["baselines"][0].update(cached_input_tokens=True),
+        lambda document: document["baselines"][0].update(output_tokens=-1),
+        lambda document: document["baselines"][0].update(e2e_seconds=-1.0),
+        lambda document: document["baselines"][0].update(e2e_seconds=float("nan")),
+        lambda document: document["baselines"][0].update(measured_at="yesterday"),
+        lambda document: document["baselines"][0].update(measured_at=""),
+        lambda document: document["baselines"][0].update(source=""),
+    ],
+)
+def test_validate_baselines_rejects_malformed_documents(mutate) -> None:
+    document = json.loads((EVAL_ROOT / "harness-baselines.json").read_text())
+    mutate(document)
+    with pytest.raises(ValueError):
+        report.validate_baselines(document)
+
+
+def test_report_renders_the_harness_baselines_section() -> None:
+    markdown, verdict = report.render(paired(), request())
+    assert verdict == "pass"
+    assert markdown.index("#### Harness baselines (static reference)") > markdown.index(
+        "| Metric | Exact base | PR head | Change |"
+    )
+    assert "| Harness | Resolution | Uncached input | Cached input | Output |" in markdown
+    assert "| --- | ---: | ---: | ---: | ---: |" in markdown
+    measured = report.load_baselines()
+    for harness, label in report.HARNESS_LABELS.items():
+        entry = measured.get(harness)
+        if entry is None:
+            assert f"| {label} | ?/28 | ? | ? | ? |" in markdown
+        else:
+            assert (
+                f"| {label} | {entry['resolved']}/28 | {entry['uncached_input_tokens']:,} | "
+                f"{entry['cached_input_tokens']:,} | {entry['output_tokens']:,} |" in markdown
+            )
+
+
+def zeroed_baselines() -> dict:
+    return {
+        "schema_version": 1,
+        "description": "Static harness baselines on the 28-task Short SWE suite",
+        "model": "internal/glm-5.3-fast",
+        "baselines": [
+            {
+                "harness": harness,
+                "resolved": 0,
+                "model_failures": 0,
+                "uncached_input_tokens": 0,
+                "cached_input_tokens": 0,
+                "output_tokens": 0,
+                "e2e_seconds": 0.0,
+                "measured_at": "1970-01-01T00:00:00Z",
+                "source": "placeholder",
+            }
+            for harness in report.HARNESS_LABELS
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    "content",
+    [None, "{not json", json.dumps({"schema_version": 2}), json.dumps(zeroed_baselines())],
+    ids=["absent", "corrupt", "wrong-schema", "placeholder-zeros"],
+)
+def test_unusable_baselines_render_not_yet_measured_and_never_gate(
+    content: str | None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "harness-baselines.json"
+    if content is not None:
+        path.write_text(content)
+    monkeypatch.setattr(report, "BASELINES_PATH", path)
+    markdown, verdict = report.render(paired(), request())
+    assert verdict == "pass"
+    for label in report.HARNESS_LABELS.values():
+        assert f"| {label} | ?/28 | ? | ? | ? |" in markdown
+    assert "not yet measured" in markdown
+
+
+def test_measured_baselines_render_numbers_and_never_change_the_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    document = json.loads((EVAL_ROOT / "harness-baselines.json").read_text())
+    for entry in document["baselines"]:
+        entry.update(
+            resolved=17,
+            model_failures=1,
+            uncached_input_tokens=1_234_567,
+            cached_input_tokens=890_123,
+            output_tokens=45_678,
+            e2e_seconds=4_321.5,
+            measured_at="2026-09-17T00:00:00Z",
+        )
+    measured_path = tmp_path / "measured.json"
+    measured_path.write_text(json.dumps(document))
+    monkeypatch.setattr(report, "BASELINES_PATH", measured_path)
+    markdown, verdict = report.render(paired(), request())
+    assert verdict == "pass"
+    assert "| Pi coding harness | 17/28 | 1,234,567 | 890,123 | 45,678 |" in markdown
+    assert "not yet measured" not in markdown
+    regression = paired(base_resolved=10, head_resolved=5)
+    verdicts_with = [report.render(result, request())[1] for result in (paired(), regression)]
+    monkeypatch.setattr(report, "BASELINES_PATH", tmp_path / "absent.json")
+    verdicts_without = [report.render(result, request())[1] for result in (paired(), regression)]
+    assert verdicts_with == verdicts_without == ["pass", "fail"]
+
+
 def open_directories(source: Path, destination: Path) -> tuple[int, int]:
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
     return os.open(source, flags), os.open(destination, flags)

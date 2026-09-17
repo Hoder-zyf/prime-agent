@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "description": "Static harness baselines on the 28-task Short SWE suite",
+  "model": "internal/glm-5.3-fast",
+  "baselines": [
+    {
+      "harness": "pi-coding-harness",
+      "resolved": 0,
+      "model_failures": 0,
+      "uncached_input_tokens": 0,
+      "cached_input_tokens": 0,
+      "output_tokens": 0,
+      "e2e_seconds": 0.0,
+      "measured_at": "1970-01-01T00:00:00Z",
+      "source": "Placeholder; pending the harness baseline measurement run"
+    },
+    {
+      "harness": "codex",
+      "resolved": 0,
+      "model_failures": 0,
+      "uncached_input_tokens": 0,
+      "cached_input_tokens": 0,
+      "output_tokens": 0,
+      "e2e_seconds": 0.0,
+      "measured_at": "1970-01-01T00:00:00Z",
+      "source": "Placeholder; pending the harness baseline measurement run"
+    },
+    {
+      "harness": "claude-code",
+      "resolved": 0,
+      "model_failures": 0,
+      "uncached_input_tokens": 0,
+      "cached_input_tokens": 0,
+      "output_tokens": 0,
+      "e2e_seconds": 0.0,
+      "measured_at": "1970-01-01T00:00:00Z",
+      "source": "Placeholder; pending the harness baseline measurement run"
+    },
+    {
+      "harness": "swe-agent",
+      "resolved": 0,
+      "model_failures": 0,
+      "uncached_input_tokens": 0,
+      "cached_input_tokens": 0,
+      "output_tokens": 0,
+      "e2e_seconds": 0.0,
+      "measured_at": "1970-01-01T00:00:00Z",
+      "source": "Placeholder; pending the harness baseline measurement run"
+    },
+    {
+      "harness": "bash-edit",
+      "resolved": 0,
+      "model_failures": 0,
+      "uncached_input_tokens": 0,
+      "cached_input_tokens": 0,
+      "output_tokens": 0,
+      "e2e_seconds": 0.0,
+      "measured_at": "1970-01-01T00:00:00Z",
+      "source": "Placeholder; pending the harness baseline measurement run"
+    }
+  ]
+}
