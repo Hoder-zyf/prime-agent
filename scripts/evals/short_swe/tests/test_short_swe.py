@@ -788,3 +788,58 @@ def test_compare_gates_positive_totals_over_a_zero_base() -> None:
     }
     findings = report.compare(base, head)
     assert findings, "positive totals over a zero base must gate"
+
+
+# --- filter_test_control tests ---
+
+
+class TestFilterTestControl:
+    """Execution tests for the candidate patch filter."""
+
+    def _diff(self, a: str, b: str) -> str:
+        return (
+            f"diff --git a/{a} b/{b}\n"
+            f"index 1234567..89abcde 100644\n"
+            f"--- a/{a}\n"
+            f"+++ b/{b}\n"
+            f"@@ -1 +1 @@\n+x = 1\n"
+        )
+
+    @pytest.mark.parametrize(
+        "a,b,kept",
+        [
+            ("src/module.py", "src/module.py", True),
+            ("tests/conftest.py", "tests/helpers.py", False),
+            ("src/util.py", "tests/conftest.py", False),
+            ("src/none.py", "tests/conftest.py", False),
+            ("pyproject.toml", "pyproject.toml", False),
+            ("tests/test_foo.py", "tests/test_foo.py", False),
+        ],
+    )
+    def test_filter_paths(self, a: str, b: str, kept: bool) -> None:
+        from scripts.evals.short_swe.verified_verifier import filter_test_control
+
+        result = filter_test_control(self._diff(a, b))
+        assert bool(result) == kept
+
+    def test_bytes_and_str_match(self) -> None:
+        from scripts.evals.short_swe.verified_verifier import filter_test_control
+
+        patch = self._diff("src/lib.py", "src/lib.py")
+        assert filter_test_control(patch) == filter_test_control(patch.encode())
+
+    def test_headerless_rejected_and_oversize_capped(self) -> None:
+        from scripts.evals.short_swe.verified_verifier import MAX_PATCH_BYTES, filter_test_control
+
+        with pytest.raises(RuntimeError, match="no diff --git header"):
+            filter_test_control("--- a/x\n+++ b/x\n@@ -1 +1 @@\n+x\n")
+        with pytest.raises(RuntimeError, match="exceeds"):
+            filter_test_control(b"x" * (MAX_PATCH_BYTES + 1))
+
+    def test_empty_and_multi_file(self) -> None:
+        from scripts.evals.short_swe.verified_verifier import filter_test_control
+
+        assert filter_test_control(b"") == ""
+        mixed = self._diff("src/lib.py", "src/lib.py") + self._diff("s.py", "tests/conftest.py")
+        result = filter_test_control(mixed)
+        assert "src/lib.py" in result and "conftest" not in result
