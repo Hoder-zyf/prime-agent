@@ -1,62 +1,162 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "description": "Static harness baselines on the 28-task Short SWE suite",
   "model": "internal/glm-5.3-fast",
   "baselines": [
     {
       "harness": "pi-coding-harness",
-      "resolved": 0,
+      "label": "Pi coding harness",
+      "tasksets": {
+        "swebench-verified": {
+          "resolved": 0,
+          "tasks": 15,
+          "uncached_input_tokens": 0,
+          "cached_input_tokens": 0,
+          "output_tokens": 0
+        },
+        "swebench-pro": {
+          "resolved": 0,
+          "tasks": 8,
+          "uncached_input_tokens": 0,
+          "cached_input_tokens": 0,
+          "output_tokens": 0
+        },
+        "scaleswe": {
+          "resolved": 0,
+          "tasks": 5,
+          "uncached_input_tokens": 0,
+          "cached_input_tokens": 0,
+          "output_tokens": 0
+        }
+      },
       "model_failures": 0,
-      "uncached_input_tokens": 0,
-      "cached_input_tokens": 0,
-      "output_tokens": 0,
       "e2e_seconds": 0.0,
       "measured_at": "1970-01-01T00:00:00Z",
-      "source": "Placeholder; pending the harness baseline measurement run"
+      "source": "Pending measurement run"
     },
     {
       "harness": "codex",
-      "resolved": 0,
+      "label": "Codex",
+      "tasksets": {
+        "swebench-verified": {
+          "resolved": 0,
+          "tasks": 15,
+          "uncached_input_tokens": 0,
+          "cached_input_tokens": 0,
+          "output_tokens": 0
+        },
+        "swebench-pro": {
+          "resolved": 0,
+          "tasks": 8,
+          "uncached_input_tokens": 0,
+          "cached_input_tokens": 0,
+          "output_tokens": 0
+        },
+        "scaleswe": {
+          "resolved": 0,
+          "tasks": 5,
+          "uncached_input_tokens": 0,
+          "cached_input_tokens": 0,
+          "output_tokens": 0
+        }
+      },
       "model_failures": 0,
-      "uncached_input_tokens": 0,
-      "cached_input_tokens": 0,
-      "output_tokens": 0,
       "e2e_seconds": 0.0,
       "measured_at": "1970-01-01T00:00:00Z",
-      "source": "Placeholder; pending the harness baseline measurement run"
+      "source": "Pending measurement run"
     },
     {
       "harness": "claude-code",
-      "resolved": 0,
+      "label": "Claude Code",
+      "tasksets": {
+        "swebench-verified": {
+          "resolved": 0,
+          "tasks": 15,
+          "uncached_input_tokens": 0,
+          "cached_input_tokens": 0,
+          "output_tokens": 0
+        },
+        "swebench-pro": {
+          "resolved": 0,
+          "tasks": 8,
+          "uncached_input_tokens": 0,
+          "cached_input_tokens": 0,
+          "output_tokens": 0
+        },
+        "scaleswe": {
+          "resolved": 0,
+          "tasks": 5,
+          "uncached_input_tokens": 0,
+          "cached_input_tokens": 0,
+          "output_tokens": 0
+        }
+      },
       "model_failures": 0,
-      "uncached_input_tokens": 0,
-      "cached_input_tokens": 0,
-      "output_tokens": 0,
       "e2e_seconds": 0.0,
       "measured_at": "1970-01-01T00:00:00Z",
-      "source": "Placeholder; pending the harness baseline measurement run"
+      "source": "Pending measurement run"
     },
     {
       "harness": "swe-agent",
-      "resolved": 0,
+      "label": "SWE Agent",
+      "tasksets": {
+        "swebench-verified": {
+          "resolved": 0,
+          "tasks": 15,
+          "uncached_input_tokens": 0,
+          "cached_input_tokens": 0,
+          "output_tokens": 0
+        },
+        "swebench-pro": {
+          "resolved": 0,
+          "tasks": 8,
+          "uncached_input_tokens": 0,
+          "cached_input_tokens": 0,
+          "output_tokens": 0
+        },
+        "scaleswe": {
+          "resolved": 0,
+          "tasks": 5,
+          "uncached_input_tokens": 0,
+          "cached_input_tokens": 0,
+          "output_tokens": 0
+        }
+      },
       "model_failures": 0,
-      "uncached_input_tokens": 0,
-      "cached_input_tokens": 0,
-      "output_tokens": 0,
       "e2e_seconds": 0.0,
       "measured_at": "1970-01-01T00:00:00Z",
-      "source": "Placeholder; pending the harness baseline measurement run"
+      "source": "Pending measurement run"
     },
     {
       "harness": "bash-edit",
-      "resolved": 0,
+      "label": "Bash Edit",
+      "tasksets": {
+        "swebench-verified": {
+          "resolved": 0,
+          "tasks": 15,
+          "uncached_input_tokens": 0,
+          "cached_input_tokens": 0,
+          "output_tokens": 0
+        },
+        "swebench-pro": {
+          "resolved": 0,
+          "tasks": 8,
+          "uncached_input_tokens": 0,
+          "cached_input_tokens": 0,
+          "output_tokens": 0
+        },
+        "scaleswe": {
+          "resolved": 0,
+          "tasks": 5,
+          "uncached_input_tokens": 0,
+          "cached_input_tokens": 0,
+          "output_tokens": 0
+        }
+      },
       "model_failures": 0,
-      "uncached_input_tokens": 0,
-      "cached_input_tokens": 0,
-      "output_tokens": 0,
       "e2e_seconds": 0.0,
       "measured_at": "1970-01-01T00:00:00Z",
-      "source": "Placeholder; pending the harness baseline measurement run"
+      "source": "Pending measurement run"
     }
   ]
 }

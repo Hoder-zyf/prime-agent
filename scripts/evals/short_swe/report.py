@@ -7,11 +7,11 @@ import argparse
 import json
 import math
 from collections import defaultdict
-from datetime import datetime
 from pathlib import Path
 
 MARKER = "<!-- prime-agent-behavioral-eval:v1 -->"
 TASK_COUNT = 28
+TASKSET_SIZES = {"swebench-verified": 15, "swebench-pro": 8, "scaleswe": 5}
 RESOLVED_LOSS_LIMIT = 5
 MODEL_FAILURE_LIMIT = 3
 RATIO_LIMIT = 2.0
@@ -154,10 +154,10 @@ def validate_result(result: dict, request: dict) -> tuple[dict, dict]:
 
 
 def validate_baselines(document: dict) -> dict[str, dict]:
-    """Validate a harness baselines document and return measured entries keyed by harness id."""
+    """Validate a harness baselines document and return entries keyed by harness id."""
     if (
         not isinstance(document, dict)
-        or document.get("schema_version") != 1
+        or document.get("schema_version") != 2
         or not isinstance(document.get("description"), str)
         or not document["description"]
         or not isinstance(document.get("model"), str)
@@ -167,7 +167,7 @@ def validate_baselines(document: dict) -> dict[str, dict]:
     entries = document.get("baselines")
     if not isinstance(entries, list) or len(entries) != len(HARNESS_LABELS):
         raise ValueError("harness baselines must list every harness exactly once")
-    measured: dict[str, dict] = {}
+    validated: dict[str, dict] = {}
     seen: set[str] = set()
     for entry in entries:
         if not isinstance(entry, dict) or entry.get("harness") not in HARNESS_LABELS:
@@ -176,35 +176,24 @@ def validate_baselines(document: dict) -> dict[str, dict]:
         if harness in seen:
             raise ValueError("duplicate harness baseline")
         seen.add(harness)
-        for field in ("resolved", "model_failures"):
-            value = entry.get(field)
-            if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= TASK_COUNT:
-                raise ValueError(f"invalid harness baseline {field}")
-        for field in ("uncached_input_tokens", "cached_input_tokens", "output_tokens"):
-            value = entry.get(field)
-            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-                raise ValueError(f"invalid harness baseline {field}")
-        elapsed = entry.get("e2e_seconds")
-        if (
-            not isinstance(elapsed, (int, float))
-            or isinstance(elapsed, bool)
-            or not math.isfinite(elapsed)
-            or elapsed < 0
-        ):
-            raise ValueError("invalid harness baseline e2e_seconds")
-        measured_at = entry.get("measured_at")
-        if not isinstance(measured_at, str) or not measured_at:
-            raise ValueError("invalid harness baseline measured_at")
-        try:
-            datetime.fromisoformat(measured_at)
-        except ValueError:
-            raise ValueError("invalid harness baseline measured_at") from None
-        source = entry.get("source")
-        if not isinstance(source, str) or not source:
-            raise ValueError("invalid harness baseline source")
-        if any(entry[field] != 0 for field in BASELINE_FIELDS):
-            measured[harness] = entry
-    return measured
+        tasksets = entry.get("tasksets")
+        if not isinstance(tasksets, dict) or set(tasksets) != set(TASKSET_SIZES):
+            raise ValueError(f"harness baseline for {harness} must cover every taskset")
+        for ts_id, ts in tasksets.items():
+            if not isinstance(ts, dict):
+                raise ValueError(f"invalid taskset entry for {harness}/{ts_id}")
+            expected = TASKSET_SIZES[ts_id]
+            if ts.get("tasks") != expected:
+                raise ValueError(f"harness baseline {harness}/{ts_id} must list {expected} tasks")
+            resolved = ts.get("resolved")
+            if not isinstance(resolved, int) or isinstance(resolved, bool) or not 0 <= resolved <= expected:
+                raise ValueError(f"invalid harness baseline resolved for {harness}/{ts_id}")
+            for field in ("uncached_input_tokens", "cached_input_tokens", "output_tokens"):
+                value = ts.get(field)
+                if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                    raise ValueError(f"invalid harness baseline {field} for {harness}/{ts_id}")
+        validated[harness] = entry
+    return validated
 
 
 def load_baselines(path: Path | None = None) -> dict[str, dict]:
@@ -227,21 +216,39 @@ def render_baselines(measured: dict[str, dict]) -> list[str]:
         "",
         "#### Harness baselines (static reference)",
         "",
-        "| Harness | Resolution | Uncached input | Cached input | Output |",
+        "| Harness | SWE-bench Verified | SWE-bench Pro | ScaleSWE | Total |",
         "| --- | ---: | ---: | ---: | ---: |",
     ]
     unmeasured = []
     for harness, label in HARNESS_LABELS.items():
         entry = measured.get(harness)
-        if entry is None:
+        if entry is None or not entry.get("tasksets"):
             unmeasured.append(label)
-            lines.append(f"| {label} | ?/{TASK_COUNT} | ? | ? | ? |")
-        else:
             lines.append(
-                f"| {label} | {entry['resolved']}/{TASK_COUNT} | "
-                f"{entry['uncached_input_tokens']:,} | {entry['cached_input_tokens']:,} | "
-                f"{entry['output_tokens']:,} |"
+                f"| {label} | ?/{TASKSET_SIZES['swebench-verified']} | "
+                f"?/{TASKSET_SIZES['swebench-pro']} | "
+                f"?/{TASKSET_SIZES['scaleswe']} | ?/{TASK_COUNT} |"
             )
+        else:
+            tasksets = entry["tasksets"]
+            cells = []
+            for ts_id in ("swebench-verified", "swebench-pro", "scaleswe"):
+                ts = tasksets.get(ts_id)
+                if ts and ts.get("measured"):
+                    cells.append(f"{ts.get('resolved', 0)}/{ts['tasks']}")
+                else:
+                    cells.append(f"?/{ts['tasks']}" if ts else f"?/{TASKSET_SIZES[ts_id]}")
+            total = sum(ts.get("resolved", 0) for ts in tasksets.values() if ts.get("measured"))
+            total_tasks = sum(ts["tasks"] for ts in tasksets.values())
+            if any(ts.get("measured") for ts in tasksets.values()):
+                lines.append(f"| {label} | {' | '.join(cells)} | {total}/{total_tasks} |")
+            else:
+                unmeasured.append(label)
+                lines.append(
+                    f"| {label} | ?/{TASKSET_SIZES['swebench-verified']} | "
+                    f"?/{TASKSET_SIZES['swebench-pro']} | "
+                    f"?/{TASKSET_SIZES['scaleswe']} | ?/{TASK_COUNT} |"
+                )
     lines.append("")
     if unmeasured:
         plural = "s" if len(unmeasured) > 1 else ""
