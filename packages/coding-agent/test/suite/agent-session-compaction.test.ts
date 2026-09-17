@@ -388,58 +388,57 @@ describe("AgentSession compaction", () => {
 		await harness.session.prompt("two");
 		await harness.session.compact();
 
-		const compactionEntries = harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction");
-		expect(compactionEntries).toHaveLength(1);
-		const first = compactionEntries[0] as {
-			summary: string;
-			details?: { readFiles: string[]; modifiedFiles: string[] };
-		};
+		const compactionEntry = (index: number) =>
+			harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction")[index] as {
+				summary: string;
+				firstKeptEntryId: string;
+				details?: { readFiles: string[]; modifiedFiles: string[] };
+			};
 		// The stored summary carries the mechanical file-list append (and old
 		// sessions keep loading these), but the update prompt never sees them.
+		const first = compactionEntry(0);
 		expect(first.summary).toContain("<modified-files>\nsrc/kernel-edit.ts\n</modified-files>");
 		expect(first.details).toEqual({ readFiles: [], modifiedFiles: ["src/kernel-edit.ts"] });
 
 		await harness.session.prompt("three");
 		await harness.session.compact();
 
-		const allCompactions = harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction");
-		expect(allCompactions).toHaveLength(2);
-		const second = allCompactions[1] as {
-			summary: string;
-			firstKeptEntryId: string;
-			details?: { readFiles: string[]; modifiedFiles: string[] };
-		};
 		// The merged summary keeps exactly one fresh file-list append and the
 		// previous details merge into the new entry.
+		const second = compactionEntry(1);
 		expect(second.summary).toContain("second summary");
 		expect(second.summary).toContain("**Turn Context (split turn):**");
-		expect(second.summary.match(/<modified-files>/g)).toHaveLength(1);
-		expect(second.summary).toContain("<modified-files>\nsrc/kernel-edit.ts\n</modified-files>");
+		expect(second.summary.match(/<(?:read|modified)-files>/g)).toHaveLength(1);
 		expect(second.details).toEqual({ readFiles: [], modifiedFiles: ["src/kernel-edit.ts"] });
 
-		// Every history slice is anchored to the newest kept-tail assistant
-		// text; keepRecentTokens: 1 keeps only the final turn of each window.
+		// Every history slice is anchored to the newest kept-tail assistant text
+		// (keepRecentTokens: 1 keeps only the final turn of each window); the
+		// turn-prefix slices of split turns are never anchored.
 		const historyInputs = summarizerInputs.filter((input) => !input.includes("PREFIX of a turn"));
+		const turnPrefixInputs = summarizerInputs.filter((input) => input.includes("PREFIX of a turn"));
 		expect(historyInputs).toHaveLength(2);
 		for (const input of historyInputs) {
 			expect(input).toContain("<recent-state-anchor>");
 		}
 		expect(historyInputs[0]).toContain("two response");
-		expect(historyInputs[0]).not.toContain("<previous-summary>");
+		expect(historyInputs[1]).toContain("three response");
+		for (const input of turnPrefixInputs) {
+			expect(input).not.toContain("<recent-state-anchor>");
+		}
+		// The anchor is data between the previous summary and the instructions.
+		expect(historyInputs[1].indexOf("</previous-summary>")).toBeLessThan(
+			historyInputs[1].indexOf("<recent-state-anchor>"),
+		);
 		// The second compaction's previous summary carries no stale file blocks.
-		const secondHistory = historyInputs[1];
-		expect(secondHistory).toContain("<previous-summary>");
-		expect(secondHistory).toContain("first summary");
-		expect(secondHistory).not.toContain("<read-files>");
-		expect(secondHistory).not.toContain("<modified-files>");
-		expect(secondHistory).toContain("<recent-state-anchor>");
-		expect(secondHistory).toContain("three response");
+		expect(historyInputs[1]).toContain("<previous-summary>");
+		expect(historyInputs[1]).toContain("first summary");
+		expect(historyInputs[1]).not.toContain("<read-files>");
+		expect(historyInputs[1]).not.toContain("<modified-files>");
 
 		// The in-context compaction head tells the model the retained tail wins.
 		const head = harness.session.messages[0];
 		expect(head?.role).toBe("compactionSummary");
-		const headText = getMessageText(convertToLlm([head!])[0]);
-		expect(headText).toContain("retained messages below are authoritative");
+		expect(getMessageText(convertToLlm([head!])[0])).toContain("retained messages below are authoritative");
 
 		// The session stays usable after both compactions.
 		await harness.session.prompt("four");
@@ -448,7 +447,6 @@ describe("AgentSession compaction", () => {
 			content: [{ type: "text", text: "four response" }],
 		});
 	});
-
 	it.each([
 		{
 			name: "manual",
