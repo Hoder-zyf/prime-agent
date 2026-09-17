@@ -1,443 +1,115 @@
 import stripAnsi from "strip-ansi";
 import { describe, expect, it } from "vitest";
 import { formatSessionsTable } from "../src/cli/sessions-table-format.js";
-import type { SessionActivity, SessionLifecycle, SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
+import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 
 const NOW_MS = Date.parse("2026-05-29T12:00:00.000Z");
 const HEADER = ["name", "status", "activity", "last heard", "error", "usage"];
-const DEFAULT_MODIFIED = "2026-05-29T10:00:00.000Z";
+const STALE_AT = "2026-05-29T11:50:00.000Z";
+const LONG_ID = "019e71ec-e08a-75a9-b573-fc10e9f8380f";
+const SPEND: SessionSummary["usage"] = { inputTokens: 1234, outputTokens: 567, cost: 0.4234 };
+const FLEET_SPEND: SessionSummary["usage"] = { inputTokens: 1_626_400_000, outputTokens: 2_100_000, cost: 382.85 };
+const DIAGNOSTICS: SessionSummary["diagnostics"] = [
+	{ type: "warning", message: "skill path missing" },
+	{ type: "error", message: "older extension error" },
+	{ type: "error", message: "bad extension config" },
+];
+
+function withActiveAction(active: SessionSummary["sessionActions"]["active"]): SessionSummary["sessionActions"] {
+	return { queuedCount: 0, steering: [], followUps: [], active };
+}
+const RUN_ACTIONS = withActiveAction({ kind: "session_command", phase: "running", label: "send to worker" });
+const PREP_ACTIONS = withActiveAction({ kind: "session_command", phase: "preparing" });
+
+// Base summary: a resident idle session last modified two hours before NOW_MS.
+const BASE: SessionSummary = {
+	id: "s",
+	lifecycle: "live",
+	activity: "idle",
+	isSessionActive: false,
+	activeSessionId: "a1",
+	sessionId: "session-s",
+	cwd: "/tmp/project",
+	isStreaming: false,
+	isCompacting: false,
+	attachedClients: 0,
+	messageCount: 2,
+	sessionActions: { queuedCount: 0, steering: [], followUps: [] },
+	modified: "2026-05-29T10:00:00.000Z",
+};
+
+function makeSummary(overrides: Partial<SessionSummary> = {}): SessionSummary {
+	return { ...BASE, ...overrides, isSessionActive: (overrides.activity ?? BASE.activity) === "working" };
+}
+
+function row(name: string, status: string, activity: string, lastHeard = "2h", error = "", usage = ""): string[] {
+	return [name, status, activity, lastHeard, error, usage];
+}
+
+function expectTable(sessions: SessionSummary[], expectedRows: string[][]): void {
+	const widths = HEADER.map((header, index) => Math.max(header.length, ...expectedRows.map((r) => r[index]!.length)));
+	const pad = (cells: string[]) => cells.map((cell, i) => cell.padEnd(widths[i]!)).join("  ");
+	const lines = [pad(HEADER), ...expectedRows.map(pad)];
+	expect(stripAnsi(formatSessionsTable(sessions, NOW_MS)).split("\n")).toEqual(lines);
+}
+
+const UNSORTED = [
+	makeSummary({ sessionName: "plain-saved", activeSessionId: undefined, rosterStatus: "inactive" }),
+	makeSummary({ sessionName: "worker", activity: "working", isStreaming: true }),
+	makeSummary({ sessionName: "crashed", workerState: "failed" }),
+	makeSummary({ sessionName: "sleeper", taskState: "completed" }),
+	makeSummary({ sessionName: "restarting", workerState: "recovering" }),
+];
+const EXPECTED_SORT = [
+	row("crashed", "idle", "failed", "2h", "worker failed"),
+	row("restarting", "idle", "recovering"),
+	row("worker", "running", "thinking"),
+	row("sleeper", "idle", "completed"),
+	row("plain-saved", "inactive", ""),
+];
 
 describe("formatSessionsTable", () => {
-	it("renders the header only for an empty roster", () => {
-		expectTable([], []);
-	});
-
-	it("shows a streaming agent as running with a thinking detail", () => {
-		expectTable(
-			[
-				makeSummary({
-					id: "stream",
-					activeSessionId: "active-stream",
-					activity: "working",
-					streaming: true,
-				}),
-			],
-			[["stream", "running", "thinking", "2h", "", ""]],
-		);
-	});
-
-	it("marks agents that are running tools or bash", () => {
-		expectTable(
-			[
-				makeSummary({
-					id: "tools",
-					activeSessionId: "active-tools",
-					activity: "working",
-					streaming: true,
-					runningTools: true,
-				}),
-				makeSummary({ id: "bash", activeSessionId: "active-bash", activity: "working", bash: true }),
-				makeSummary({
-					id: "compact",
-					activeSessionId: "active-compact",
-					activity: "working",
-					compacting: true,
-				}),
-			],
-			[
-				["tools", "running", "running tools", "2h", "", ""],
-				["bash", "running", "running bash", "2h", "", ""],
-				["compact", "running", "compacting", "2h", "", ""],
-			],
-		);
-	});
-
-	it("falls back to the roster status when no exception mark is set", () => {
-		expectTable(
-			[
-				makeSummary({
-					id: "idle-agent",
-					activeSessionId: "active-idle",
-					activity: "idle",
-					taskState: "completed",
-				}),
-				makeSummary({ id: "saved-agent", activity: "idle", rosterStatus: "inactive" }),
-			],
-			[
-				["idle-agent", "idle", "completed", "2h", "", ""],
-				["saved-agent", "inactive", "", "2h", "", ""],
-			],
-		);
-	});
-
-	it("shows exceptional status labels instead of the plain roster status", () => {
-		expectTable(
-			[
-				makeSummary({
-					id: "queued-agent",
-					activeSessionId: "active-queued",
-					activity: "working",
-					statusLabel: "queued",
-				}),
-				makeSummary({
-					id: "recovering-agent",
-					activeSessionId: "active-recovering",
-					activity: "idle",
-					statusLabel: "recovering",
-				}),
-				makeSummary({
-					id: "failed-agent",
-					activeSessionId: "active-failed",
-					activity: "idle",
-					statusLabel: "failed",
-				}),
-			],
-			[
-				["failed-agent", "failed", "", "2h", "worker failed", ""],
-				["recovering-agent", "recovering", "", "2h", "", ""],
-				["queued-agent", "queued", "classifying", "2h", "", ""],
-			],
-		);
-	});
-
-	it("prefers the latest error diagnostic over the worker mark and fallback notice", () => {
-		expectTable(
-			[
-				makeSummary({
-					id: "broken-agent",
-					activeSessionId: "active-broken",
-					activity: "idle",
-					workerState: "failed",
-					modelFallbackMessage: "No models available",
-					diagnostics: [
-						{ type: "warning", message: "skill path missing" },
-						{ type: "error", message: 'Extension "./ext" error: bad config' },
-					],
-				}),
-			],
-			[["broken-agent", "idle", "failed", "2h", 'Extension "./ext" error: bad config', ""]],
-		);
-	});
-
-	it("falls back to the model notice only when no error diagnostic exists", () => {
-		expectTable(
-			[
-				makeSummary({
-					id: "model-agent",
-					activeSessionId: "active-model",
-					activity: "idle",
-					modelFallbackMessage: "Could not restore model anthropic/old-model",
-				}),
-			],
-			[["model-agent", "idle", "", "2h", "Could not restore model anthropic/old-model", ""]],
-		);
-	});
-
-	it("uses worker staleness when reported and the modified age otherwise", () => {
-		expectTable(
-			[
-				makeSummary({
-					id: "stale-agent",
-					activeSessionId: "active-stale",
-					activity: "working",
-					lastHeardFromAt: "2026-05-29T11:50:00.000Z",
-					modified: "2026-05-29T10:00:00.000Z",
-				}),
-				makeSummary({
-					id: "fresh-agent",
-					activeSessionId: "active-fresh",
-					activity: "working",
-					streaming: true,
-				}),
-			],
-			[
-				["stale-agent", "running", "classifying", "10m", "", ""],
-				["fresh-agent", "running", "thinking", "2h", "", ""],
-			],
-		);
-	});
-
-	it("appends the recap to the activity detail and truncates long cells", () => {
-		expectTable(
-			[
-				makeSummary({
-					id: "busy-agent",
-					activeSessionId: "active-busy",
-					activity: "working",
-					streaming: true,
-					runningTools: true,
-					summary: "a".repeat(100),
-				}),
-			],
-			[["busy-agent", "running", `running tools · ${"a".repeat(43)}…`, "2h", "", ""]],
-		);
-	});
-
-	it("formats usage compactly and leaves the cell empty without usage", () => {
-		expectTable(
-			[
-				makeSummary({
-					id: "spending-agent",
-					activeSessionId: "active-spending",
-					activity: "idle",
-					usage: { inputTokens: 1234, outputTokens: 567, cost: 0.4234 },
-				}),
-				makeSummary({
-					id: "fleet-agent",
-					activeSessionId: "active-fleet",
-					activity: "idle",
-					usage: { inputTokens: 1_626_400_000, outputTokens: 2_100_000, cost: 382.85 },
-				}),
-				makeSummary({ id: "free-agent", activeSessionId: "active-free", activity: "idle" }),
-			],
-			[
-				["spending-agent", "idle", "", "2h", "", "1.2k/567 $0.42"],
-				["fleet-agent", "idle", "", "2h", "", "1.6b/2.1m $382.85"],
-				["free-agent", "idle", "", "2h", "", ""],
-			],
-		);
+	it.each<[string, Partial<SessionSummary> | null, string[]]>([
+		["empty roster renders the header only", null, []],
+		["thinking detail", { activity: "working", isStreaming: true }, row("s", "running", "thinking")],
+		["running bash", { activity: "working", isBashRunning: true }, row("s", "running", "running bash")],
+		["compacting", { activity: "working", isCompacting: true }, row("s", "running", "compacting")],
+		["completed verdict", { taskState: "completed" }, row("s", "idle", "completed")],
+		["saved status", { activeSessionId: undefined, rosterStatus: "inactive" }, row("s", "inactive", "")],
+		["queued label", { activity: "working", statusLabel: "queued" }, row("s", "queued", "classifying")],
+		["recovering label", { statusLabel: "recovering" }, row("s", "recovering", "")],
+		["failed label", { statusLabel: "failed" }, row("s", "failed", "", "2h", "worker failed")],
+		[
+			"prefers the latest error diagnostic over the worker mark and the model notice",
+			{ workerState: "failed", modelFallbackMessage: "none", diagnostics: DIAGNOSTICS },
+			row("s", "idle", "failed", "2h", "bad extension config"),
+		],
+		["model notice", { modelFallbackMessage: "no model" }, row("s", "idle", "", "2h", "no model")],
+		["staleness", { activity: "working", lastHeardFromAt: STALE_AT }, row("s", "running", "classifying", "10m")],
+		["usage compact", { usage: SPEND }, row("s", "idle", "", "2h", "", "1.2k/567 $0.42")],
+		[
+			"appends the recap to the activity detail and truncates long cells",
+			{ activity: "working", isStreaming: true, isRunningTools: true, summary: "a".repeat(100) },
+			["s", "running", `running tools · ${"a".repeat(43)}…`, "2h", "", ""],
+		],
+		["usage fleet scale", { usage: FLEET_SPEND }, row("s", "idle", "", "2h", "", "1.6b/2.1m $382.85")],
+		["archived rows", { lifecycle: "archived", rosterStatus: "inactive" }, row("s", "inactive", "archived")],
+		["display id fallback", { id: LONG_ID, sessionName: undefined }, row("fc10e9f8380f", "idle", "")],
+		["newline in name", { sessionName: "sneaky\nagent" }, row("sneaky agent", "idle", "")],
+		["ansi in name", { sessionName: "\u001B[31mansi\u001B[39m agent" }, row("ansi agent", "idle", "")],
+		["control chars in name", { sessionName: "beep\u0007 agent" }, row("beep agent", "idle", "")],
+		["heartbeat", { hasActiveHeartbeat: true }, row("s", "idle", "heartbeat")],
+		["action label", { activity: "working", sessionActions: RUN_ACTIONS }, row("s", "running", "send to worker")],
+		["kind label", { activity: "working", sessionActions: PREP_ACTIONS }, row("s", "running", "session command")],
+		["queued actions", { sessionActions: { ...BASE.sessionActions, queuedCount: 2 } }, row("s", "idle", "2 queued")],
+		["starting worker", { activity: "working", workerState: "starting" }, row("s", "running", "starting")],
+		["stopping worker", { workerState: "stopping" }, row("s", "idle", "stopping")],
+		["replied subagent", { runtimeKind: "subagent", repliedSinceTask: true }, row("s", "idle", "replied")],
+	])("%s", (_name, overrides, expected) => {
+		expectTable(overrides ? [makeSummary(overrides)] : [], overrides ? [expected] : []);
 	});
 
 	it("sorts failures first, then recovering workers, then running, then idle, then the rest", () => {
-		expectTable(
-			[
-				makeSummary({ id: "plain-saved", activity: "idle", rosterStatus: "inactive" }),
-				makeSummary({ id: "worker", activeSessionId: "active-worker", activity: "working", streaming: true }),
-				makeSummary({
-					id: "crashed",
-					activeSessionId: "active-crashed",
-					activity: "idle",
-					workerState: "failed",
-				}),
-				makeSummary({
-					id: "sleeper",
-					activeSessionId: "active-sleeper",
-					activity: "idle",
-					taskState: "completed",
-				}),
-				makeSummary({
-					id: "restarting",
-					activeSessionId: "active-restarting",
-					activity: "idle",
-					workerState: "recovering",
-				}),
-			],
-			[
-				["crashed", "idle", "failed", "2h", "worker failed", ""],
-				["restarting", "idle", "recovering", "2h", "", ""],
-				["worker", "running", "thinking", "2h", "", ""],
-				["sleeper", "idle", "completed", "2h", "", ""],
-				["plain-saved", "inactive", "", "2h", "", ""],
-			],
-		);
-	});
-
-	it("marks archived rows from --all as archived", () => {
-		expectTable(
-			[makeSummary({ id: "archived-agent", activity: "idle", lifecycle: "archived", rosterStatus: "inactive" })],
-			[["archived-agent", "inactive", "archived", "2h", "", ""]],
-		);
-	});
-
-	it("falls back to the compact display id for unnamed agents", () => {
-		expectTable(
-			[
-				makeSummary({
-					id: "019e71ec-e08a-75a9-b573-fc10e9f8380f",
-					activeSessionId: "active-unnamed",
-					activity: "idle",
-					unnamed: true,
-				}),
-			],
-			[["fc10e9f8380f", "idle", "", "2h", "", ""]],
-		);
-	});
-
-	it("compacts whitespace in session names so each row stays on one line", () => {
-		expectTable(
-			[
-				makeSummary({
-					id: "newline-agent",
-					activeSessionId: "active-newline",
-					activity: "idle",
-					sessionName: "sneaky\nagent",
-				}),
-			],
-			[["sneaky agent", "idle", "", "2h", "", ""]],
-		);
-	});
-
-	it("strips terminal escape sequences from session names", () => {
-		expectTable(
-			[
-				makeSummary({
-					id: "ansi-agent",
-					activeSessionId: "active-ansi",
-					activity: "idle",
-					sessionName: "\u001B[31mansi\u001B[39m agent",
-				}),
-			],
-			[["ansi agent", "idle", "", "2h", "", ""]],
-		);
-	});
-
-	it("strips control characters from session names", () => {
-		expectTable(
-			[
-				makeSummary({
-					id: "control-agent",
-					activeSessionId: "active-control",
-					activity: "idle",
-					sessionName: "beep\u0007 agent",
-				}),
-			],
-			[["beep agent", "idle", "", "2h", "", ""]],
-		);
-	});
-
-	it("renders a heartbeating idle agent with its registered heartbeat", () => {
-		expectTable(
-			[
-				makeSummary({
-					id: "heartbeat-agent",
-					activeSessionId: "active-heartbeat",
-					activity: "idle",
-					hasActiveHeartbeat: true,
-				}),
-			],
-			[["heartbeat-agent", "idle", "heartbeat", "2h", "", ""]],
-		);
-	});
-
-	it("mirrors the remaining activity detail branches of the agents-view label", () => {
-		expectTable(
-			[
-				makeSummary({
-					id: "action-agent",
-					activeSessionId: "active-action",
-					activity: "working",
-					sessionActions: {
-						queuedCount: 0,
-						steering: [],
-						followUps: [],
-						active: { kind: "session_command", phase: "running", label: "Sending to worker" },
-					},
-				}),
-				makeSummary({
-					id: "kind-agent",
-					activeSessionId: "active-kind",
-					activity: "working",
-					sessionActions: {
-						queuedCount: 0,
-						steering: [],
-						followUps: [],
-						active: { kind: "session_command", phase: "preparing" },
-					},
-				}),
-				makeSummary({
-					id: "queued-actions",
-					activeSessionId: "active-queued-actions",
-					activity: "idle",
-					sessionActions: { queuedCount: 2, steering: [], followUps: [] },
-				}),
-				makeSummary({
-					id: "starting-agent",
-					activeSessionId: "active-starting",
-					activity: "working",
-					workerState: "starting",
-				}),
-				makeSummary({
-					id: "stopping-agent",
-					activeSessionId: "active-stopping",
-					activity: "idle",
-					workerState: "stopping",
-				}),
-				makeSummary({
-					id: "replied-subagent",
-					activeSessionId: "active-replied",
-					activity: "idle",
-					runtimeKind: "subagent",
-					repliedSinceTask: true,
-				}),
-			],
-			[
-				["action-agent", "running", "Sending to worker", "2h", "", ""],
-				["kind-agent", "running", "session command", "2h", "", ""],
-				["starting-agent", "running", "starting", "2h", "", ""],
-				["queued-actions", "idle", "2 queued", "2h", "", ""],
-				["stopping-agent", "idle", "stopping", "2h", "", ""],
-				["replied-subagent", "idle", "replied", "2h", "", ""],
-			],
-		);
+		expectTable(UNSORTED, EXPECTED_SORT);
 	});
 });
-
-/** Assert the exact rendered table against the expected cell values. */
-function expectTable(sessions: SessionSummary[], expectedRows: string[][]): void {
-	const rendered = stripAnsi(formatSessionsTable(sessions, NOW_MS));
-	const widths = HEADER.map((headerCell, index) =>
-		Math.max(headerCell.length, ...expectedRows.map((row) => row[index]!.length)),
-	);
-	const pad = (cells: string[]) => cells.map((cell, index) => cell.padEnd(widths[index]!)).join("  ");
-	expect(rendered.split("\n")).toEqual([pad(HEADER), ...expectedRows.map((row) => pad(row))]);
-}
-
-interface SummaryOptions {
-	id: string;
-	activeSessionId?: string;
-	activity: SessionActivity;
-	lifecycle?: SessionLifecycle;
-	streaming?: boolean;
-	runningTools?: boolean;
-	bash?: boolean;
-	compacting?: boolean;
-	statusLabel?: SessionSummary["statusLabel"];
-	workerState?: SessionSummary["workerState"];
-	lastHeardFromAt?: string;
-	modified?: string;
-	taskState?: SessionSummary["taskState"];
-	rosterStatus?: SessionSummary["rosterStatus"];
-	summary?: string;
-	usage?: SessionSummary["usage"];
-	diagnostics?: SessionSummary["diagnostics"];
-	modelFallbackMessage?: string;
-	hasActiveHeartbeat?: boolean;
-	sessionActions?: SessionSummary["sessionActions"];
-	runtimeKind?: SessionSummary["runtimeKind"];
-	repliedSinceTask?: boolean;
-	sessionName?: string;
-	unnamed?: boolean;
-}
-
-function makeSummary(options: SummaryOptions): SessionSummary {
-	return {
-		id: options.id,
-		lifecycle: options.lifecycle ?? "live",
-		activity: options.activity,
-		isSessionActive: options.activity === "working",
-		...(options.activeSessionId ? { activeSessionId: options.activeSessionId } : {}),
-		sessionId: `session-${options.id}`,
-		...(options.unnamed ? {} : { sessionName: options.sessionName ?? options.id }),
-		cwd: "/tmp/project",
-		isStreaming: options.streaming ?? false,
-		isCompacting: options.compacting ?? false,
-		...(options.runningTools !== undefined ? { isRunningTools: options.runningTools } : {}),
-		...(options.bash !== undefined ? { isBashRunning: options.bash } : {}),
-		...(options.runtimeKind ? { runtimeKind: options.runtimeKind } : {}),
-		...(options.repliedSinceTask ? { repliedSinceTask: true } : {}),
-		attachedClients: 0,
-		messageCount: 2,
-		sessionActions: options.sessionActions ?? { queuedCount: 0, steering: [], followUps: [] },
-		modified: options.modified ?? DEFAULT_MODIFIED,
-		...(options.statusLabel ? { statusLabel: options.statusLabel } : {}),
-		...(options.workerState ? { workerState: options.workerState } : {}),
-		...(options.lastHeardFromAt ? { lastHeardFromAt: options.lastHeardFromAt } : {}),
-		...(options.taskState ? { taskState: options.taskState } : {}),
-		...(options.rosterStatus ? { rosterStatus: options.rosterStatus } : {}),
-		...(options.summary !== undefined ? { summary: options.summary } : {}),
-		...(options.usage ? { usage: options.usage } : {}),
-		...(options.diagnostics ? { diagnostics: options.diagnostics } : {}),
-		...(options.modelFallbackMessage ? { modelFallbackMessage: options.modelFallbackMessage } : {}),
-		...(options.hasActiveHeartbeat ? { hasActiveHeartbeat: true } : {}),
-	};
-}

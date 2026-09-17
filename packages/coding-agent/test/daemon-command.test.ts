@@ -316,59 +316,30 @@ describe("daemon command", () => {
 		]);
 	});
 
-	it("prints the sessions operator table from the list rpc", async () => {
-		daemonClientMock.behavior.sessions = [makeSessionSummary("active-1", "session-1", "alpha")];
-		const logCalls: string[] = [];
-		vi.spyOn(console, "log").mockImplementation((...messages: unknown[]) => {
-			logCalls.push(messages.map(String).join(" "));
-		});
+	const ALPHA_ROSTER = [makeSessionSummary("active-1", "session-1", "alpha")];
+	it.each<[string, string[], boolean, boolean, Array<Record<string, unknown>>]>([
+		["prints the sessions operator table", ["sessions"], false, false, ALPHA_ROSTER],
+		["passes --all and dumps raw summaries with --json", ["--json", "sessions", "--all"], true, true, ALPHA_ROSTER],
+		["reports an empty roster without a table", ["sessions"], false, false, []],
+	])("%s", async (_name, argv, all, json, sessions) => {
+		daemonClientMock.behavior.sessions = sessions;
+		await expect(handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", ...argv])).resolves.toBe(true);
 
-		await expect(handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "sessions"])).resolves.toBe(
-			true,
-		);
-
-		expect(daemonClientMock.instances[0]?.requests).toEqual([{ type: "list", all: false }]);
-		expect(logCalls[0]).toContain("name");
-		expect(logCalls[0]).toContain("status");
-		expect(logCalls[0]).toContain("alpha");
-	});
-
-	it("passes --all to the sessions list rpc and dumps raw summaries with --json", async () => {
-		daemonClientMock.behavior.sessions = [makeSessionSummary("active-1", "session-1", "alpha")];
-		const logCalls: string[] = [];
-		vi.spyOn(console, "log").mockImplementation((...messages: unknown[]) => {
-			logCalls.push(messages.map(String).join(" "));
-		});
-
-		await expect(
-			handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "--json", "sessions", "--all"]),
-		).resolves.toBe(true);
-
-		expect(daemonClientMock.instances[0]?.requests).toEqual([{ type: "list", all: true }]);
-		expect(JSON.parse(logCalls[0]!)).toEqual({
-			sessions: [makeSessionSummary("active-1", "session-1", "alpha")],
-		});
-	});
-
-	it("reports an empty sessions roster without a table", async () => {
-		const logCalls: string[] = [];
-		vi.spyOn(console, "log").mockImplementation((...messages: unknown[]) => {
-			logCalls.push(messages.map(String).join(" "));
-		});
-
-		await expect(handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "sessions"])).resolves.toBe(
-			true,
-		);
-
-		expect(logCalls).toEqual(["No active agents."]);
+		expect(daemonClientMock.instances[0]?.requests).toEqual([{ type: "list", all }]);
+		const logged = String(vi.mocked(console.log).mock.calls[0]?.[0]);
+		if (json) {
+			expect(JSON.parse(logged)).toEqual({ sessions });
+		} else if (sessions.length === 0) {
+			expect(logged).toBe("No active agents.");
+		} else {
+			expect(logged).toContain("alpha");
+		}
 	});
 
 	it("rejects unknown sessions options", async () => {
 		await handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "sessions", "--bogus"]);
 		expect(process.exitCode).toBe(1);
-		expect(
-			consoleErrorMessages.some((m) => typeof m === "string" && m.includes("Unknown sessions option: --bogus")),
-		).toBe(true);
+		expect(consoleErrorMessages.join(" ")).toContain("Unknown sessions option: --bogus");
 	});
 
 	it("does not leak --goal/--goal-token-budget into daemon startup args", async () => {

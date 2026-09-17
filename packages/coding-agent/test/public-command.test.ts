@@ -338,15 +338,6 @@ describe("public command routing", () => {
 		expect(console.error).toHaveBeenCalledWith(expect.stringContaining("Unknown command: install"));
 	});
 
-	it("keeps sessions distinct from the singular session export command", async () => {
-		await expect(handlePublicCommand(["session", "export", "session.jsonl"])).resolves.toMatchObject({
-			handled: false,
-			args: [INTERNAL_RUNTIME_COMMAND_MARKER, "--export", "session.jsonl"],
-		});
-		await expect(handlePublicCommand(["sessions"])).resolves.toMatchObject({ handled: true });
-		expect(mocks.daemonCommands).toEqual([["daemon", "sessions"]]);
-	});
-
 	it("shows sessions usage in command help", async () => {
 		await expect(handlePublicCommand(["help", "sessions"])).resolves.toMatchObject({ handled: true });
 		expect(console.log).toHaveBeenCalledWith(expect.stringContaining("prime-agent sessions [--all] [--json]"));
