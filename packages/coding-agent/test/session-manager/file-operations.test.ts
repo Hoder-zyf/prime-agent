@@ -56,26 +56,17 @@ describe("loadEntriesFromFile", () => {
 		rmSync(tempDir, { recursive: true, force: true });
 	});
 
-	it("returns empty array for non-existent file", () => {
-		const entries = loadEntriesFromFile(join(tempDir, "nonexistent.jsonl"));
-		expect(entries).toEqual([]);
-	});
-
-	it("returns empty array for empty file", () => {
-		const file = join(tempDir, "empty.jsonl");
-		writeFileSync(file, "");
-		expect(loadEntriesFromFile(file)).toEqual([]);
-	});
-
-	it("returns empty array for file without valid session header", () => {
-		const file = join(tempDir, "no-header.jsonl");
-		writeFileSync(file, '{"type":"message","id":"1"}\n');
-		expect(loadEntriesFromFile(file)).toEqual([]);
-	});
-
-	it("returns empty array for malformed JSON", () => {
-		const file = join(tempDir, "malformed.jsonl");
-		writeFileSync(file, "not json\n");
+	const emptyFiles: Array<[string, string | undefined]> = [
+		["a non-existent file", undefined],
+		["an empty file", ""],
+		["a file without a valid session header", '{"type":"message","id":"1"}\n'],
+		["a malformed line", "not json\n"],
+	];
+	it.each(emptyFiles)("returns an empty array for %s", (_case, content) => {
+		const file = join(tempDir, "entries.jsonl");
+		if (content !== undefined) {
+			writeFileSync(file, content);
+		}
 		expect(loadEntriesFromFile(file)).toEqual([]);
 	});
 
@@ -681,64 +672,30 @@ describe("SessionManager.setSessionFile with corrupted files", () => {
 		}
 	});
 
-	it("truncates and rewrites empty file with valid header", () => {
-		const emptyFile = join(tempDir, "empty.jsonl");
-		writeFileSync(emptyFile, "");
-
-		const sm = SessionManager.open(emptyFile, tempDir);
-
+	const noHeader = '{"type":"message","id":"abc","message":{"role":"assistant"}}\n';
+	const damaged: Array<[string, string]> = [
+		["an empty file", ""],
+		["a file with no session header", noHeader],
+	];
+	it.each(damaged)("truncates and rewrites %s into a valid session", (_case, content) => {
+		const file = join(tempDir, "recovered.jsonl");
+		writeFileSync(file, content);
+		const sm = SessionManager.open(file, tempDir);
 		expect(sm.getSessionId()).toBeTruthy();
-		expect(sm.getHeader()).toBeTruthy();
 		expect(sm.getHeader()?.type).toBe("session");
-
-		const content = readFileSync(emptyFile, "utf-8");
-		const lines = content.trim().split("\n").filter(Boolean);
+		const lines = readFileSync(file, "utf-8").trim().split("\n").filter(Boolean);
 		expect(lines.length).toBe(1);
-		const header = JSON.parse(lines[0]);
-		expect(header.type).toBe("session");
-		expect(header.id).toBe(sm.getSessionId());
+		expect(JSON.parse(lines[0]).id).toBe(sm.getSessionId());
 	});
 
-	it("truncates and rewrites file without valid header", () => {
-		const noHeaderFile = join(tempDir, "no-header.jsonl");
-		writeFileSync(
-			noHeaderFile,
-			'{"type":"message","id":"abc","parentId":"orphaned","timestamp":"2025-01-01T00:00:00Z","message":{"role":"assistant","content":"test"}}\n',
-		);
-
-		const sm = SessionManager.open(noHeaderFile, tempDir);
-
-		expect(sm.getSessionId()).toBeTruthy();
-		expect(sm.getHeader()).toBeTruthy();
-		expect(sm.getHeader()?.type).toBe("session");
-
-		const content = readFileSync(noHeaderFile, "utf-8");
-		const lines = content.trim().split("\n").filter(Boolean);
-		expect(lines.length).toBe(1);
-		const header = JSON.parse(lines[0]);
-		expect(header.type).toBe("session");
-		expect(header.id).toBe(sm.getSessionId());
-	});
-
-	it("preserves explicit session file path when recovering from corrupted file", () => {
-		const explicitPath = join(tempDir, "my-session.jsonl");
-		writeFileSync(explicitPath, "");
-
-		const sm = SessionManager.open(explicitPath, tempDir);
-
-		expect(sm.getSessionFile()).toBe(explicitPath);
-	});
-
-	it("subsequent loads of recovered file work correctly", () => {
-		const corruptedFile = join(tempDir, "corrupted.jsonl");
-		writeFileSync(corruptedFile, "garbage content\n");
-
-		const sm1 = SessionManager.open(corruptedFile, tempDir);
-		const sessionId = sm1.getSessionId();
-
-		const sm2 = SessionManager.open(corruptedFile, tempDir);
-		expect(sm2.getSessionId()).toBe(sessionId);
-		expect(sm2.getHeader()?.type).toBe("session");
+	it("keeps the explicit path and a stable id across recovered loads", () => {
+		const file = join(tempDir, "my-session.jsonl");
+		writeFileSync(file, "garbage content\n");
+		const first = SessionManager.open(file, tempDir);
+		expect(first.getSessionFile()).toBe(file);
+		const second = SessionManager.open(file, tempDir);
+		expect(second.getSessionId()).toBe(first.getSessionId());
+		expect(second.getHeader()?.type).toBe("session");
 	});
 });
 
@@ -965,5 +922,70 @@ describe("readSessionInfo incremental scans", () => {
 		writeFileSync(file, line(header) + line(msg("m1", null, "user", "after recreate")));
 		utimesSync(file, fixedTime, fixedTime);
 		expect((await readSessionInfo(file))?.firstMessage).toBe("after recreate");
+	});
+	describe("tool-result entries counted from their headers", () => {
+		const usage = { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, cost: { total: 3 } };
+		const tokens = { inputTokens: 1, outputTokens: 2, cost: 3 };
+		const entry = (body: string, idFirst = false) =>
+			idFirst
+				? `{"id":"e","parentId":null,"timestamp":"${header.timestamp}","type":"message",${body}}\n`
+				: `{"type":"message","id":"e","parentId":null,"timestamp":"${header.timestamp}",${body}}\n`;
+		const message = (role: string, body: string, idFirst = false) =>
+			entry(`"message":{"role":"${role}",${body}}`, idFirst);
+		const ask = message("user", '"content":"hello","timestamp":1');
+		const reply = message("assistant", `"content":"reply","timestamp":1,"usage":${JSON.stringify(usage)}`);
+		const prompt = line(header) + ask + reply;
+		const tool = (text: string, idFirst = false) =>
+			message("toolResult", `"content":"${text}","timestamp":5000`, idFirst);
+		/** An entry torn mid-write: its serialized header is intact, its JSON is not. */
+		const torn = (entry: string) => entry.slice(0, entry.indexOf('"content"'));
+		const write = (name: string, content: string) => {
+			const file = join(tempDir, `${name}.jsonl`);
+			writeFileSync(file, content);
+			return file;
+		};
+
+		const counted: Array<[string, () => string, number]> = [
+			["an unparsed", () => torn(tool("partial")), 3],
+			["an oversized", () => tool("y".repeat(1024 * 1024 + 512)), 3],
+			["an id-first", () => tool("paste", true) + torn(tool("partial", true)), 4],
+		];
+		it.each(counted)("counts %s tool result from its header", async (_case, build, messageCount) => {
+			const info = await readSessionInfo(write("counted", prompt + build()));
+			expect(info).toMatchObject({ messageCount, allMessagesText: "hello reply", usage: tokens });
+			expect(info?.firstMessage).toBe("hello");
+		});
+
+		it("counts a torn tool-result tail once across incremental scans", async () => {
+			const file = write("torn-append", prompt + torn(tool("partial")));
+			expect((await readSessionInfo(file))?.messageCount).toBe(3);
+			appendFileSync(file, '"content":"paste"},"timestamp":5000}}\n');
+			expect((await readSessionInfo(file))?.messageCount).toBe(3);
+		});
+
+		it("drops a damaged session whose first entry is a tool result", async () => {
+			expect(await readSessionInfo(write("headerless", tool("paste")))).toBeNull();
+			expect(await SessionManager.listAll(undefined, tempDir)).toEqual([]);
+		});
+
+		const container = `{"type":"message","meta":{"message":{"role":"toolResult"}},"message":{"role":"user","content":"kept","timestamp":1}}`;
+		const embedded = `{"id":"n1","parentId":null,"timestamp":"${header.timestamp}","type":"session_info","data":{"type":"message","message":{"role":"toolResult"}}}`;
+		const spaced = `{"type": "message", "message": {"role": "toolResult", "content": [{"type": "text", "text": "spaced"}], "isError": false}}`;
+		const quoted = 'bench log: {"type":"message","message":{"role":"toolResult"}}';
+		const boundary = (idLength: number) =>
+			`{"type":"message","id":"${"x".repeat(idLength)}","parentId":null,"timestamp":"${header.timestamp}","message":{"role":"user","content":"kept","timestamp":1}}`;
+		const boundaryId = 512 - 19 - boundary(0).indexOf('"message":{"role":"');
+		const quotedReply = line(msg("a2", "a1", "assistant", quoted));
+
+		it.each([
+			["a container before the role marker", `${line(header)}${container}\n`, 1, "kept"],
+			["a quoted header inside text", `${prompt}${quotedReply}`, 3, `hello reply ${quoted}`],
+			["a spaced layout", `${prompt}${spaced}\n`, 3, "hello reply"],
+			["the role at the prefix boundary", `${line(header)}${boundary(boundaryId)}\n`, 1, "kept"],
+			["an embedded header inside a payload", `${line(header)}${embedded}\n${ask}`, 1, "hello"],
+		])("folds %s through the full parse", async (_layout, content, messageCount, allMessagesText) => {
+			const info = await readSessionInfo(write("fallback", content));
+			expect(info).toMatchObject({ messageCount, allMessagesText });
+		});
 	});
 });
