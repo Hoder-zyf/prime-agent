@@ -4190,9 +4190,7 @@ describe("daemon worker supervisor monitoring", () => {
 					version: 1,
 					pid: options.orphan.pid,
 					ownerPid: workerPid,
-					...(options.orphan.processStartId === undefined
-						? {}
-						: { processStartId: options.orphan.processStartId }),
+					...(options.orphan.processStartId && { processStartId: options.orphan.processStartId }),
 					active: true,
 					recordedAt: new Date().toISOString(),
 				})}\n`,

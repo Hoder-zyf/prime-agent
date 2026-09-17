@@ -41,11 +41,8 @@ function tempDir(prefix = "pi-session-append-"): string {
 	return dir;
 }
 
-/** Header plus a chained transcript, shaped like a real session file. */
-function sessionLines(
-	dir: string,
-	options: { entries?: number; allUser?: boolean; textBytes?: number; version?: number } = {},
-): string[] {
+/** Header plus a chained user-message transcript, shaped like a real session file. */
+function sessionLines(dir: string, options: { entries?: number; textBytes?: number; version?: number } = {}): string[] {
 	const count = options.entries ?? 4;
 	const lines = [
 		JSON.stringify({
@@ -61,27 +58,14 @@ function sessionLines(
 		const id = `e${i}`;
 		const timestamp = 1_767_225_600_000 + i;
 		const text = options.textBytes !== undefined && i === count - 1 ? "x".repeat(options.textBytes) : `payload ${i}`;
-		const usage = {
-			input: 1,
-			output: 1,
-			cacheRead: 0,
-			cacheWrite: 0,
-			totalTokens: 2,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-		};
-		const assistant = {
-			role: "assistant",
-			content: [{ type: "text", text }],
-			api: "openai-completions",
-			provider: "openai",
-			model: "test",
-			stopReason: "stop",
-			usage,
-			timestamp,
-		};
-		const message = options.allUser === true || i % 2 === 0 ? { role: "user", content: text, timestamp } : assistant;
 		lines.push(
-			JSON.stringify({ type: "message", id, parentId, timestamp: new Date(timestamp).toISOString(), message }),
+			JSON.stringify({
+				type: "message",
+				id,
+				parentId,
+				timestamp: new Date(timestamp).toISOString(),
+				message: { role: "user", content: text, timestamp },
+			}),
 		);
 		parentId = id;
 	}
@@ -105,8 +89,7 @@ function rawFile(file: string): Buffer {
 }
 
 function lastLine(file: string): Record<string, unknown> {
-	const lines = rawFile(file).toString("utf8").trimEnd().split("\n");
-	return JSON.parse(lines[lines.length - 1]!);
+	return JSON.parse(rawFile(file).toString("utf8").trimEnd().split("\n").at(-1)!);
 }
 
 /** The bytes appended to `file` since `before`, parsed as JSON. */
@@ -200,14 +183,14 @@ describe("append metadata to an existing session file", () => {
 		const torn = writeSession(dir, "torn.jsonl", chain, false);
 		appendSessionInfoToExistingFile(torn, "Renamed");
 		const repaired = rawFile(torn).toString("utf8").trimEnd().split("\n");
-		expect(JSON.parse(repaired[repaired.length - 2]!)).toMatchObject({ type: "message", id: "e2" });
+		expect(JSON.parse(repaired.at(-2)!)).toMatchObject({ type: "message", id: "e2" });
 		expect(lastLine(torn)).toMatchObject({ type: "session_info", name: "Renamed", parentId: "e2" });
 	});
 
 	it("appends a lifecycle state entry and the worker notice through the fast path", () => {
 		const dir = tempDir();
 		// No assistant entry yet, which a live append would suppress.
-		const file = writeSession(dir, "archive-notice.jsonl", sessionLines(dir, { entries: 3, allUser: true }));
+		const file = writeSession(dir, "archive-notice.jsonl", sessionLines(dir, { entries: 3 }));
 		const state = fastAppend(file, () => appendSessionStateToExistingFile(file, { status: "archived" }));
 		expect(state).toMatchObject({ type: "session_state", state: { status: "archived" }, parentId: "e2" });
 
@@ -247,15 +230,12 @@ describe("append metadata to an existing session file", () => {
 		expect(fsMocks.appendFileSync).not.toHaveBeenCalled(); // nothing created, appended, or rewritten
 		expect(rawFile(invalid).toString("utf8")).toBe(contents);
 	});
+
 	it("keeps the full-open drop for a fallback session without an assistant entry", () => {
 		// The oversized tail forces the fallback, and the live manager suppresses
 		// the notice without an assistant entry, so nothing is appended.
 		const dir = tempDir();
-		const file = writeSession(
-			dir,
-			"fallback-notice.jsonl",
-			sessionLines(dir, { entries: 3, allUser: true, textBytes: 300_000 }),
-		);
+		const file = writeSession(dir, "fallback-notice.jsonl", sessionLines(dir, { entries: 3, textBytes: 300_000 }));
 		const before = rawFile(file);
 		resetIo();
 		appendCustomMessageToExistingFile(file, "prime-agent.worker_recovery", NOTICE, false, {
@@ -305,21 +285,17 @@ describe("daemon catalog metadata commands", () => {
 				details: { activeSessionId: "active-1", operations: ["model_stream"] },
 				parentId: archived.id,
 			});
+
+			// A header-invalid sibling: the rename refusal propagates cleanly and the file is untouched.
+			const invalid = writeSession(sessionDir, "invalid.jsonl", [
+				"not json at all",
+				...sessionLines(sessionDir, { entries: 1 }).slice(1),
+			]);
+			const contents = rawFile(invalid).toString("utf8");
+			await expect(client.rename(invalid, "Nope")).rejects.toThrow(/no valid session header/);
+			expect(rawFile(invalid).toString("utf8")).toBe(contents);
 		});
 		// Every command appended in place and left the transcript it read untouched.
 		expect(rawFile(file).subarray(0, before.length).equals(before)).toBe(true);
-	});
-
-	it("rejects a rename of a header-invalid file with a clean error", async () => {
-		const sessionDir = tempDir("pa-catalog-invalid-");
-		const file = writeSession(sessionDir, "invalid.jsonl", [
-			"not json at all",
-			...sessionLines(sessionDir, { entries: 1 }).slice(1), // no session header anywhere
-		]);
-		const contents = rawFile(file).toString("utf8");
-		await withCatalog(async (client) => {
-			await expect(client.rename(file, "Nope")).rejects.toThrow(/no valid session header/);
-		});
-		expect(rawFile(file).toString("utf8")).toBe(contents); // untouched, no stub rewrite
 	});
 });
