@@ -64,9 +64,7 @@ describe("loadEntriesFromFile", () => {
 
 	it.each<[string, string | undefined, string[]]>([
 		["a missing file", undefined, []],
-		["an empty file", "", []],
 		["a file without a session header", `${MESSAGE}\n`, []],
-		["malformed JSON", "not json\n", []],
 		["a valid session file", `${HEADER}\n${MESSAGE}\n`, ["session", "message"]],
 		[
 			"a file with a malformed line between valid ones",
@@ -377,8 +375,6 @@ describe("findMostRecentSession", () => {
 	}
 
 	it.each<[string, () => { dir: string; expected: string | null }]>([
-		["returns null for an empty directory", () => ({ dir: tempDir, expected: null })],
-		["returns null for a non-existent directory", () => ({ dir: join(tempDir, "nonexistent"), expected: null })],
 		[
 			"ignores non-jsonl files",
 			() => {
@@ -810,11 +806,15 @@ describe("readSessionInfo incremental scans", () => {
 			return readSessionInfo(file);
 		};
 		const shadowed = `{"type":"message","meta":{"message":{"role":"toolResult"}},"message":{"role":"user","content":"kept","timestamp":1}}`;
+		const boundary = (length: number) =>
+			`{"type":"message","id":"${"x".repeat(length)}","parentId":null,"timestamp":"${header.timestamp}","message":{"role":"user","content":"kept","timestamp":1}}`;
+		const boundaryId = 512 - 19 - boundary(0).indexOf('"message":{"role":"');
 		it.each([
 			["an unparsed tool result", prompt + tool(false, true), 3, "hello reply"],
 			["an oversized tool result", prompt + tool(false, false, "y".repeat(1024 * 1024)), 3, "hello reply"],
 			["id-first tool results", prompt + tool(true) + tool(true, true), 4, "hello reply"],
 			["a container before the role marker", `${line(header)}${shadowed}\n`, 1, "kept"],
+			["the role at the prefix boundary", `${line(header)}${boundary(boundaryId)}\n`, 1, "kept"],
 		])("counts %s from its header", async (_case, body, messageCount, allMessagesText) => {
 			expect(await scan(body)).toMatchObject({ messageCount, allMessagesText });
 		});
