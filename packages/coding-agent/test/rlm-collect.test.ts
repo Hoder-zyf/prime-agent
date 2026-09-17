@@ -934,6 +934,69 @@ describe("rlm.collect typed fan-in", () => {
 		});
 	});
 
+	// The replacement's delete failed, so it never got a receipt: it stays
+	// resident, still owns the reused name, and must keep the deleted
+	// generation's tombstone from answering the selector.
+	it("keeps a failed-cleanup run-less replacement off the deleted generation's cancelled envelope", async () => {
+		const gate = createGatedStream();
+		const hostedChildren: AgentSession[] = [];
+		const makeHostedChild = (): AgentSession => {
+			const root = session;
+			const child = makeSession(gate.streamFn);
+			session = root;
+			hostedChildren.push(child);
+			return child;
+		};
+		const root = makeSession(gate.streamFn, {
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => ({ session: makeHostedChild() }),
+				// Only the run-less replacement's delete fails; the spawned
+				// generation's cleanup must settle so its tombstone exists.
+				deleteRlmSubagentRuntime: async (childId: string) => {
+					if (childId === "runless-failed") throw new Error("injected cleanup failure");
+				},
+			},
+		});
+		session = root;
+
+		const first = await root.runRlmChild("first shard", { name: "reused-worker" });
+		await waitForCondition(() => gate.startedPrompts.has("first shard"), 10_000);
+		await root.deleteRlmSubagent(first.rlm_child_id);
+		await waitForRlmRunCleanup(gate, root, [first.rlm_child_id]);
+		expect((await root.collectRlmChildren([first.rlm_child_id], 0)).results[0]).toMatchObject({
+			rlm_child_id: first.rlm_child_id,
+			status: "cancelled",
+			settled: true,
+		});
+
+		// A run-less retained child reuses the name, then its delete throws.
+		const retainedChild = makeSession(undefined, {
+			rlmSessionDir: join(tempDir, "runless-failed"),
+		});
+		session = root;
+		retainedChild.setSessionName("reused-worker");
+		expect(root.registerRlmChildSession("runless-failed", retainedChild)).toBe(true);
+		await expect(root.deleteRlmSubagent("reused-worker")).rejects.toThrow("injected cleanup failure");
+
+		// The replacement still owns the name: a same-name spawn stays blocked.
+		await expect(root.runRlmChild("blocked shard", { name: "reused-worker" })).rejects.toThrow(
+			'Agent name "reused-worker" is unavailable',
+		);
+		// The failed delete leaves the replacement resident and name-bound, so
+		// the deleted generation's tombstone must stay silent for the selector.
+		await expect(root.collectRlmChildren(["reused-worker"], 0)).rejects.toThrow(
+			'No direct RLM child matches "reused-worker" in the current parent session',
+		);
+		const byOldId = await root.collectRlmChildren([first.rlm_child_id], 0);
+		expect(byOldId.results).toHaveLength(1);
+		expect(byOldId.results[0]).toMatchObject({
+			rlm_child_id: first.rlm_child_id,
+			status: "cancelled",
+			settled: true,
+		});
+		for (const hosted of hostedChildren) hosted.dispose();
+	});
+
 	it("throws for unknown selectors and keeps ambiguity detection", async () => {
 		session = makeSession();
 		await expect(session.collectRlmChildren(["no-such-child"], 0)).rejects.toThrow(

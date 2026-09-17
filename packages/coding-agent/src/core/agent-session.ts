@@ -11068,17 +11068,18 @@ export class AgentSession {
 					const preflight = candidatePreflight || runlessPreflight;
 					// A live run-less retained child (a daemon-hydrated child, for example)
 					// never enters candidates, so without this scan the deleted generation
-					// of a reused name would answer for it. While the replacement is live
-					// — no reservation, receipt, or failed cleanup hides it — it owns the
-					// selector, so both deleted-generation fallbacks stay silent and the
-					// selector throws no-match, exactly like the mid-preflight convention.
+					// of a reused name would answer for it. While the replacement stays
+					// resident it owns the selector: a reservation or receipt may hide it
+					// from listings, and a failed delete cleanup hides it from listings
+					// only — it never returned a receipt, so both deleted-generation
+					// fallbacks stay silent and the selector throws no-match, exactly
+					// like the mid-preflight convention.
 					const liveRunlessMatch = [...this._rlmChildSessions].some(
 						([childId, retained]) =>
 							!retained.run &&
 							!candidates.has(childId) &&
 							!this._deletingRlmChildren.has(childId) &&
 							!this._deletedRlmChildIds.has(childId) &&
-							!this._rlmChildCleanupFailures.has(childId) &&
 							(childId === target ||
 								retained.session.sessionId === target ||
 								retained.session.sessionName === target),
