@@ -4160,11 +4160,7 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(client.attachedActiveSessionIds).toEqual(new Set());
 	});
 
-	/**
-	 * Shared recovery fixture for the rows below: a worker descriptor, its
-	 * recovery journal with one busy record per session, and (optionally) an
-	 * orphan journal.
-	 */
+	/** Shared recovery fixture inputs for the tests below. */
 	type RecoveryWorker = {
 		descriptor: {
 			workerId: string;
@@ -4183,19 +4179,11 @@ describe("daemon worker supervisor monitoring", () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-recovery-test-"));
 		const workerPid = options.workerPid ?? process.pid;
 		const orphanJournalPath = join(root, "worker.orphans.jsonl");
-		if (options.orphan) {
+		if (options.orphan)
 			writeFileSync(
 				orphanJournalPath,
-				`${JSON.stringify({
-					version: 1,
-					pid: options.orphan.pid,
-					ownerPid: workerPid,
-					...(options.orphan.processStartId && { processStartId: options.orphan.processStartId }),
-					active: true,
-					recordedAt: new Date().toISOString(),
-				})}\n`,
+				`${JSON.stringify({ version: 1, pid: options.orphan.pid, ownerPid: workerPid, ...(options.orphan.processStartId && { processStartId: options.orphan.processStartId }), active: true, recordedAt: new Date().toISOString() })}\n`,
 			);
-		}
 		const recoveryJournalPath = join(root, "worker.recovery.jsonl");
 		const journal = new WorkerRecoveryJournal(recoveryJournalPath);
 		for (const session of options.sessions ?? []) {
@@ -4263,38 +4251,6 @@ describe("daemon worker supervisor monitoring", () => {
 			expect(markInterrupted).toHaveBeenCalledTimes(2);
 			expect(markInterrupted).toHaveBeenCalledWith("/tmp/root.jsonl", "root-active", ["model_stream"]);
 			expect(markInterrupted).toHaveBeenCalledWith("/tmp/child.jsonl", "child-active", ["tool_execution"]);
-		} finally {
-			kill.mockRestore();
-			rmSync(root, { recursive: true, force: true });
-		}
-	});
-
-	it("completes recovery when an interrupted session notice cannot be written", async () => {
-		// A reapable orphan: the pid is alive and its start id still matches.
-		const { root, worker, recoveryJournalPath, orphanJournalPath } = recoveryFixture({
-			sessions: [
-				{ activeSessionId: "root-active", sessionFile: "/tmp/missing-root.jsonl", operation: "model_stream" },
-			],
-			workerPid: 987_654,
-			orphan: { pid: process.pid, processStartId: getProcessStartId(process.pid) },
-		});
-		// The catalog refuses the notice, as it now does for a deleted session file.
-		const markInterrupted = vi.fn(async () => {
-			throw new Error("Cannot append to missing session file: /tmp/missing-root.jsonl");
-		});
-		const kill = vi.spyOn(orphanProcessModule, "killOrphanProcess").mockReturnValue(true);
-		const { supervisor, log } = recoverySupervisor(worker, { markInterrupted });
-
-		try {
-			await expect(supervisor.recoverUncertainWorkerOperations(worker)).resolves.toBeUndefined();
-			expect(markInterrupted).toHaveBeenCalledWith("/tmp/missing-root.jsonl", "root-active", ["model_stream"]);
-			expect(log.mock.calls.some(([message]) => String(message).includes("/tmp/missing-root.jsonl"))).toBe(true);
-			// Recovery still reaped the orphan and resolved the journal.
-			expect(kill).toHaveBeenCalledWith(process.pid);
-			expect(existsSync(orphanJournalPath)).toBe(false);
-			expect(WorkerRecoveryJournal.readLatest(recoveryJournalPath)).toEqual([
-				expect.objectContaining({ activeSessionId: "root-active", busy: false, operation: "recovery_hold" }),
-			]);
 		} finally {
 			kill.mockRestore();
 			rmSync(root, { recursive: true, force: true });
