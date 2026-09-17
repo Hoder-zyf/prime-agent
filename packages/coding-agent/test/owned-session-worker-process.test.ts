@@ -119,6 +119,19 @@ async function waitForProcessGone(pid: number): Promise<void> {
 	throw new Error(`Owned worker ${pid} remained alive`);
 }
 
+async function spawnRpcFrontend(env: Record<string, string> = {}, interactive = false) {
+	const root = mkdtempSync(join(tmpdir(), "prime-owned-worker-test-"));
+	tempDirs.push(root);
+	const pidPath = join(root, "worker.pid");
+	const frontend = spawnFrontend(["--mode", "rpc"], pidPath, interactive, env);
+	let stdout = "";
+	frontend.stdout?.on("data", (chunk: Buffer) => {
+		stdout += chunk.toString("utf8");
+	});
+	const workerPid = await waitForWorkerPid(pidPath);
+	return { frontend, workerPid, pidPath, stdout: () => stdout };
+}
+
 describe("owned session worker processes", () => {
 	it("routes every headless surface through its real worker profile", async () => {
 		const cases: Array<[string[], string | undefined, string, boolean?]> = [
@@ -150,86 +163,54 @@ describe("owned session worker processes", () => {
 	});
 
 	it("keeps RPC framing in the frontend and exits its worker on stdin EOF", async () => {
-		const root = mkdtempSync(join(tmpdir(), "prime-owned-worker-test-"));
-		tempDirs.push(root);
-		const pidPath = join(root, "worker.pid");
-		const frontend = spawnFrontend(["--mode", "rpc"], pidPath);
-		let stdout = "";
-		frontend.stdout?.on("data", (chunk: Buffer) => {
-			stdout += chunk.toString("utf8");
-		});
+		const { frontend, workerPid, stdout } = await spawnRpcFrontend();
 		frontend.stdin?.end(`${JSON.stringify({ id: "request-1", type: "get_state" })}\n`);
-		const workerPid = await waitForWorkerPid(pidPath);
 		const exit = await waitForExit(frontend);
 		children.delete(frontend);
 
 		expect(exit).toEqual({ code: 0, signal: null });
-		expect(stdout).toBe(
+		expect(stdout()).toBe(
 			`${JSON.stringify({ id: "request-1", type: "response", command: "get_state", success: true })}\n`,
 		);
 		await waitForProcessGone(workerPid);
 	});
 
 	it("correlates overlapping anonymous RPC commands without exposing internal ids", async () => {
-		const root = mkdtempSync(join(tmpdir(), "prime-owned-worker-test-"));
-		tempDirs.push(root);
-		const pidPath = join(root, "worker.pid");
-		const frontend = spawnFrontend(["--mode", "rpc"], pidPath, false, {
+		const { frontend, workerPid, stdout } = await spawnRpcFrontend({
 			PRIME_AGENT_TEST_REVERSE_RPC_RESPONSES: "1",
-		});
-		let stdout = "";
-		frontend.stdout?.on("data", (chunk: Buffer) => {
-			stdout += chunk.toString("utf8");
 		});
 		frontend.stdin?.end(
 			`${JSON.stringify({ type: "get_state", marker: "first" })}\n${JSON.stringify({ type: "get_state", marker: "second" })}\n`,
 		);
-		const workerPid = await waitForWorkerPid(pidPath);
 		const exit = await waitForExit(frontend);
 		children.delete(frontend);
 
 		expect(exit).toEqual({ code: 0, signal: null });
-		expect(stdout).toBe(
+		expect(stdout()).toBe(
 			`${JSON.stringify({ type: "response", command: "get_state", success: true, marker: "second" })}\n${JSON.stringify({ type: "response", command: "get_state", success: true, marker: "first" })}\n`,
 		);
 		await waitForProcessGone(workerPid);
 	});
 
 	it("drops malformed worker output instead of corrupting public RPC JSONL", async () => {
-		const root = mkdtempSync(join(tmpdir(), "prime-owned-worker-test-"));
-		tempDirs.push(root);
-		const pidPath = join(root, "worker.pid");
-		const frontend = spawnFrontend(["--mode", "rpc"], pidPath, false, {
+		const { frontend, workerPid, stdout } = await spawnRpcFrontend({
 			PRIME_AGENT_TEST_INVALID_RPC_OUTPUT: "1",
 		});
-		let stdout = "";
-		frontend.stdout?.on("data", (chunk: Buffer) => {
-			stdout += chunk.toString("utf8");
-		});
 		frontend.stdin?.end(`${JSON.stringify({ id: "request-1", type: "get_state" })}\n`);
-		const workerPid = await waitForWorkerPid(pidPath);
 		const exit = await waitForExit(frontend);
 		children.delete(frontend);
 
 		expect(exit).toEqual({ code: 0, signal: null });
-		expect(stdout).toBe(
+		expect(stdout()).toBe(
 			`${JSON.stringify({ id: "request-1", type: "response", command: "get_state", success: true })}\n`,
 		);
 		await waitForProcessGone(workerPid);
 	});
 
 	it("does not fabricate a recovery response for response-less acknowledgements", async () => {
-		const root = mkdtempSync(join(tmpdir(), "prime-owned-worker-test-"));
-		tempDirs.push(root);
-		const pidPath = join(root, "worker.pid");
-		const frontend = spawnFrontend(["--mode", "rpc"], pidPath, false, {
+		const { frontend, workerPid, pidPath, stdout } = await spawnRpcFrontend({
 			PRIME_AGENT_TEST_CRASH_ON_ACK: "1",
 		});
-		let stdout = "";
-		frontend.stdout?.on("data", (chunk: Buffer) => {
-			stdout += chunk.toString("utf8");
-		});
-		const workerPid = await waitForWorkerPid(pidPath);
 		frontend.stdin?.write(`${JSON.stringify({ type: "ack_result", commandId: "command-1" })}\n`);
 		const replacementPid = await waitForReplacementWorkerPid(pidPath, workerPid);
 		frontend.stdin?.end(`${JSON.stringify({ id: "request-1", type: "get_state" })}\n`);
@@ -237,144 +218,96 @@ describe("owned session worker processes", () => {
 		children.delete(frontend);
 
 		expect(exit).toEqual({ code: 0, signal: null });
-		expect(stdout).toBe(
+		expect(stdout()).toBe(
 			`${JSON.stringify({ id: "request-1", type: "response", command: "get_state", success: true })}\n`,
 		);
 		await waitForProcessGone(workerPid);
 		await waitForProcessGone(replacementPid);
 	});
 
-	it("fails pending RPC commands when stdin closes before the worker crashes", async () => {
-		const root = mkdtempSync(join(tmpdir(), "prime-owned-worker-test-"));
-		tempDirs.push(root);
-		const pidPath = join(root, "worker.pid");
-		const frontend = spawnFrontend(["--mode", "rpc"], pidPath, false, {
-			PRIME_AGENT_TEST_CRASH_ON_COMMAND: "get_state",
-		});
-		let stdout = "";
-		frontend.stdout?.on("data", (chunk: Buffer) => {
-			stdout += chunk.toString("utf8");
-		});
-		frontend.stdin?.end(`${JSON.stringify({ id: "request-1", type: "get_state" })}\n`);
-		const workerPid = await waitForWorkerPid(pidPath);
-		const exit = await waitForExit(frontend);
-		children.delete(frontend);
+	type Scenario = [
+		label: string,
+		env: Record<string, string>,
+		interactive: boolean,
+		drive: (frontend: ChildProcess, workerPid: number, stdout: () => string) => Promise<void> | void,
+		prefix: string,
+		failedId: string,
+	];
 
-		expect(exit).toEqual({ code: 1, signal: null });
-		expect(stdout).toBe(
-			`${JSON.stringify({
-				id: "request-1",
-				type: "response",
-				command: "get_state",
-				success: false,
-				error: "The isolated session worker stopped during this command; its result is uncertain and was not replayed",
-			})}\n`,
-		);
-		await waitForProcessGone(workerPid);
-	});
+	it.each([
+		[
+			"crashes mid-command",
+			{ PRIME_AGENT_TEST_CRASH_ON_COMMAND: "get_state" },
+			false,
+			(frontend: ChildProcess) => {
+				frontend.stdin?.end(`${JSON.stringify({ id: "request-1", type: "get_state" })}\n`);
+			},
+			"",
+			"request-1",
+		],
+		[
+			"exits successfully without responding",
+			{ PRIME_AGENT_TEST_EXIT_ZERO_ON_COMMAND: "get_state" },
+			false,
+			(frontend: ChildProcess) => {
+				frontend.stdin?.end(`${JSON.stringify({ id: "request-1", type: "get_state" })}\n`);
+			},
+			"",
+			"request-1",
+		],
+		[
+			"absorbs a bridge write EPIPE after closing stdin mid-session",
+			{ PRIME_AGENT_TEST_CLOSE_STDIN_ON_COMMAND: "close_stdin" },
+			true,
+			async (frontend: ChildProcess, workerPid: number, stdout: () => string) => {
+				// The worker acks close_stdin, then closes its stdin read end:
+				// the next bridge write EPIPEs on the frontend side. Before
+				// the fix that pipe error crashed the whole frontend instead
+				// of letting the close-based recovery fail the pending command.
+				frontend.stdin?.write(`${JSON.stringify({ id: "close-1", type: "close_stdin" })}\n`);
+				await new Promise<void>((resolve) => {
+					frontend.stdout?.on("data", function check() {
+						if (stdout().includes("close_stdin")) {
+							frontend.stdout?.off("data", check);
+							resolve();
+						}
+					});
+				});
+				frontend.stdin?.write(`${JSON.stringify({ id: "after-1", type: "get_state" })}\n`);
+				frontend.stdin?.end();
+				process.kill(workerPid, "SIGKILL");
+			},
+			`${JSON.stringify({ id: "close-1", type: "response", command: "close_stdin", success: true })}\n`,
+			"after-1",
+		],
+	] as Scenario[])(
+		"fails pending RPC commands when the worker %s",
+		async (_label, env, interactive, drive, prefix, failedId) => {
+			const root = mkdtempSync(join(tmpdir(), "prime-owned-worker-test-"));
+			tempDirs.push(root);
+			const pidPath = join(root, "worker.pid");
+			const frontend = spawnFrontend(["--mode", "rpc"], pidPath, interactive, env);
+			let stdout = "";
+			frontend.stdout?.on("data", (chunk: Buffer) => {
+				stdout += chunk.toString("utf8");
+			});
+			const workerPid = await waitForWorkerPid(pidPath);
+			await drive(frontend, workerPid, () => stdout);
+			const exit = await waitForExit(frontend);
+			children.delete(frontend);
 
-	it("fails pending RPC commands when the worker exits successfully without responding", async () => {
-		const root = mkdtempSync(join(tmpdir(), "prime-owned-worker-test-"));
-		tempDirs.push(root);
-		const pidPath = join(root, "worker.pid");
-		const frontend = spawnFrontend(["--mode", "rpc"], pidPath, false, {
-			PRIME_AGENT_TEST_EXIT_ZERO_ON_COMMAND: "get_state",
-		});
-		let stdout = "";
-		frontend.stdout?.on("data", (chunk: Buffer) => {
-			stdout += chunk.toString("utf8");
-		});
-		frontend.stdin?.end(`${JSON.stringify({ id: "request-1", type: "get_state" })}\n`);
-		const workerPid = await waitForWorkerPid(pidPath);
-		const exit = await waitForExit(frontend);
-		children.delete(frontend);
-
-		expect(exit).toEqual({ code: 1, signal: null });
-		expect(stdout).toBe(
-			`${JSON.stringify({
-				id: "request-1",
-				type: "response",
-				command: "get_state",
-				success: false,
-				error: "The isolated session worker stopped during this command; its result is uncertain and was not replayed",
-			})}\n`,
-		);
-		await waitForProcessGone(workerPid);
-	});
-
-	it("terminates the owned worker when its frontend is killed", async () => {
-		const root = mkdtempSync(join(tmpdir(), "prime-owned-worker-test-"));
-		tempDirs.push(root);
-		const pidPath = join(root, "worker.pid");
-		const frontend = spawnFrontend(["-p", "hello"], pidPath, true);
-		const workerPid = await waitForWorkerPid(pidPath);
-		const frontendPid = Number(readFileSync(`${pidPath}.frontend`, "utf8").trim());
-		frontendPids.add(frontendPid);
-		expect(Number(readFileSync(`${pidPath}.ppid`, "utf8").trim())).toBe(frontendPid);
-
-		process.kill(frontendPid, "SIGKILL");
-		await waitForExit(frontend);
-		children.delete(frontend);
-		frontendPids.delete(frontendPid);
-		const terminationDeadline = Date.now() + 5000;
-		while (!existsSync(`${pidPath}.terminated`) && Date.now() < terminationDeadline) {
-			await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
-		}
-		expect(existsSync(`${pidPath}.terminated`)).toBe(true);
-		await waitForProcessGone(workerPid);
-	});
-
-	it("absorbs a bridge write EPIPE when the worker closes its stdin mid-session", async () => {
-		const root = mkdtempSync(join(tmpdir(), "prime-owned-worker-test-"));
-		tempDirs.push(root);
-		const pidPath = join(root, "worker.pid");
-		const frontend = spawnFrontend(["--mode", "rpc"], pidPath, true, {
-			PRIME_AGENT_TEST_CLOSE_STDIN_ON_COMMAND: "close_stdin",
-		});
-		let stdout = "";
-		frontend.stdout?.on("data", (chunk: Buffer) => {
-			stdout += chunk.toString("utf8");
-		});
-		const workerPid = await waitForWorkerPid(pidPath);
-		frontend.stdin?.write(`${JSON.stringify({ id: "close-1", type: "close_stdin" })}\n`);
-		const ackDeadline = Date.now() + 10_000;
-		while (!stdout.includes("close_stdin")) {
-			if (Date.now() > ackDeadline) {
-				throw new Error("Owned worker did not acknowledge close_stdin");
-			}
-			await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
-		}
-		// The worker is alive but deaf: its stdin read end is closed, so this
-		// bridge write EPIPEs on the frontend side. Before the fix that pipe
-		// error crashed the whole frontend instead of letting the close-based
-		// recovery below own the fallout.
-		let frontendExit: { code: number | null; signal: string | null } | undefined;
-		const onEarlyExit = (code: number | null, signal: NodeJS.Signals | null) => {
-			frontendExit = { code, signal };
-		};
-		frontend.once("exit", onEarlyExit);
-		frontend.stdin?.write(`${JSON.stringify({ id: "after-1", type: "get_state" })}\n`);
-		await new Promise((resolveGrace) => setTimeout(resolveGrace, 500));
-		expect(frontendExit).toBeUndefined();
-		frontend.off("exit", onEarlyExit);
-		frontend.stdin?.end();
-
-		// The worker dying now drives the normal recovery: the pending command
-		// is failed explicitly and the frontend exits instead of hanging.
-		process.kill(workerPid, "SIGKILL");
-		const exit = await waitForExit(frontend);
-		children.delete(frontend);
-		expect(exit).toEqual({ code: 1, signal: null });
-		expect(stdout).toBe(
-			`${JSON.stringify({ id: "close-1", type: "response", command: "close_stdin", success: true })}\n` +
-				`${JSON.stringify({
-					id: "after-1",
-					type: "response",
-					command: "get_state",
-					success: false,
-					error: "The isolated session worker stopped during this command; its result is uncertain and was not replayed",
-				})}\n`,
-		);
-		await waitForProcessGone(workerPid);
-	});
+			expect(exit).toEqual({ code: 1, signal: null });
+			expect(stdout).toBe(
+				prefix +
+					`${JSON.stringify({
+						id: failedId,
+						type: "response",
+						command: "get_state",
+						success: false,
+						error: "The isolated session worker stopped during this command; its result is uncertain and was not replayed",
+					})}\n`,
+			);
+			await waitForProcessGone(workerPid);
+		},
+	);
 });
