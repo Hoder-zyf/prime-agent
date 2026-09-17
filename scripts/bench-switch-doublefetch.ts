@@ -260,6 +260,9 @@ async function runTrial(trial: number, agentDir: string, workspace: string): Pro
 	const daemon: ChildProcess = spawn(process.execPath, [entrypoint, "--mode", "daemon", "--daemon-socket", socketPath], {
 		stdio: "ignore",
 		env: supervisorEnvironment(agentDir),
+		// Own process group: the supervisor leaves its session worker running on
+		// SIGTERM, so the trial stops the whole group when it tears down.
+		detached: true,
 	});
 	const trialStart = performance.now();
 	try {
@@ -340,23 +343,46 @@ async function runTrial(trial: number, agentDir: string, workspace: string): Pro
 				[...counters.responseBytes.values()].reduce((a, b) => a + b, 0),
 		};
 		await withTimeout(connection.dispose(), 15_000, "dispose");
+		// The supervisor's SIGTERM path closes its socket without stopping the detached
+		// session worker, so the teardown asks for the worker-stopping shutdown while
+		// this socket is still open.
+		await withTimeout(
+			supervisor.request({ type: "shutdown", force: true } as unknown as DaemonCommand, 10_000),
+			15_000,
+			"shutdown",
+		).catch(() => undefined);
 		supervisor.close();
 		const elapsed = performance.now() - trialStart;
 		if (elapsed > TRIAL_DEADLINE_MS) throw new Error(`trial exceeded ${TRIAL_DEADLINE_MS}ms budget`);
 		return result;
 	} finally {
-		daemon.kill("SIGTERM");
-		await new Promise<void>((resolve) => {
-			const timer = setTimeout(() => {
-				daemon.kill("SIGKILL");
-				resolve();
-			}, 5_000);
-			daemon.once("exit", () => {
-				clearTimeout(timer);
-				resolve();
-			});
-		});
+		await stopDaemon(daemon);
 	}
+}
+
+/**
+ * Wait for the supervisor to finish the shutdown the trial requested, and fall back
+ * to signals so a wedged daemon cannot leave the benchmark hanging. A supervisor
+ * killed with SIGTERM alone would leave its detached session worker (and that
+ * worker's session state) running after the trial.
+ */
+async function stopDaemon(daemon: ChildProcess): Promise<void> {
+	for (const signal of [undefined, "SIGTERM", "SIGKILL"] as const) {
+		if (await waitForDaemonExit(daemon, signal === undefined ? 10_000 : 5_000)) return;
+		daemon.kill(signal ?? "SIGTERM");
+	}
+}
+
+/** Resolve true when the daemon has exited within the budget. */
+async function waitForDaemonExit(daemon: ChildProcess, timeoutMs: number): Promise<boolean> {
+	if (daemon.exitCode !== null || daemon.signalCode !== null) return true;
+	return await new Promise<boolean>((resolve) => {
+		const timer = setTimeout(() => resolve(false), timeoutMs);
+		daemon.once("exit", () => {
+			clearTimeout(timer);
+			resolve(true);
+		});
+	});
 }
 
 const args = process.argv.slice(2);
@@ -394,8 +420,7 @@ if (results.length > 0) {
 	console.log(`median total wire bytes:       ${(median(results.map((r) => r.totalBytes)) / 1024 / 1024).toFixed(1)}MB`);
 }
 
-// Worker daemons spawned during the trials outlive the supervisor socket and can
-// keep this process alive, so the printed summary is the exit point. Flush stdout
-// first so piped output is not truncated.
+// Flush stdout before exiting so piped output is not truncated, and leave through
+// process.exit: a stray daemon handle must not keep the benchmark alive.
 await new Promise<void>((resolve) => process.stdout.write("", () => resolve()));
 process.exit(0);

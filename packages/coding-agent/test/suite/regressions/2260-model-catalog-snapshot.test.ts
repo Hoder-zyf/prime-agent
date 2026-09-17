@@ -101,8 +101,7 @@ describe("model catalog refresh preserves the attached transcript", () => {
 			await connection.setThinkingLevel("medium");
 			const snapshot = await connection.getInitialSnapshot();
 			expect(snapshot.messages).toBe(updatedMessages);
-			expect(request.mock.calls.map(([command]) => command.type)).toContain("get_session_context");
-			expect(request.mock.calls.map(([command]) => command.type)).not.toContain("get_messages");
+			expect(request.mock.calls.map(([command]) => command.type)).toContain("get_messages");
 			request.mockClear();
 			expect(await connection.getInitialSnapshot()).toBe(snapshot);
 			expect(await connection.getState()).toBe(snapshot.state);
@@ -193,7 +192,7 @@ describe("model catalog refresh preserves the attached transcript", () => {
 			const merged = await connection.getInitialSnapshot();
 			expect(merged.messages).toBe(updatedMessages);
 			expect(await connection.getInitialSnapshot()).toBe(merged);
-			expect(request.mock.calls.filter(([command]) => command.type === "get_messages")).toHaveLength(0);
+			expect(request.mock.calls.filter(([command]) => command.type === "get_messages")).toHaveLength(1);
 			expect(request.mock.calls.filter(([command]) => command.type === "get_session_context")).toHaveLength(1);
 		} finally {
 			await connection.dispose();

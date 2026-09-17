@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { realpathSync } from "node:fs";
+import { basename, isAbsolute, resolve } from "node:path";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ImageContent, ServiceTier, Transport } from "@earendil-works/pi-ai";
 import { appendRotatingLog, getAgentLogPath, getDaemonLogPath } from "../../config.js";
@@ -122,7 +124,16 @@ interface ReplacementSnapshotExpectation {
 	promise: Promise<void>;
 	resolve: () => void;
 	reject: (error: Error) => void;
+	/** Session file the switch asked for; other sessions' replacements must not satisfy it. */
+	targetSessionFile?: string;
 }
+
+/**
+ * A transport loss abandoned the in-flight snapshot streams. The connection
+ * re-attaches and re-syncs the session, so a switch waiting on a replacement must
+ * not treat an abandoned stream as a failed replacement.
+ */
+class SnapshotTransferAbandonedError extends Error {}
 
 export const DAEMON_REFINE_REQUEST_TIMEOUT_MS = 10 * 60 * 1000;
 const DAEMON_LONG_RUNNING_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1000;
@@ -331,7 +342,10 @@ export class DaemonAgentConnection implements AgentConnection {
 		if (!directSessionSurvives) {
 			this.sessionInputPauses.clear();
 			this.sessionInputPauseGeneration++;
-			this.rejectSnapshotAssemblies(error);
+			// The stream died with the transport. A waiting switch is not failed here:
+			// a recoverable close re-attaches and its resync snapshot settles the wait,
+			// while the terminal paths below abort it.
+			this.rejectSnapshotAssemblies(new SnapshotTransferAbandonedError(error.message));
 		}
 		if (this.initialAttachPending) {
 			// attach() owns failure handling until the initial attach settles.
@@ -344,6 +358,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		// A lost direct link invalidates the fence (holders learn via the generation bump) yet the session falls back.
 		if (invalidatedInputPause && !(error instanceof DaemonDirectTransportClosedError)) {
 			this.terminalCloseEmitted = true;
+			this.abortSnapshotTransfers(error);
 			void this.emit({
 				type: "closed",
 				error: "Daemon connection closed while session input was paused; the fence was invalidated.",
@@ -354,6 +369,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		const closeReason = getDaemonSocketCloseReason(error);
 		if (closeReason === "shutdown") {
 			this.terminalCloseEmitted = true;
+			this.abortSnapshotTransfers(error);
 			void this.emit({ type: "closed", error: this.formatDaemonSessionClosedError("shutdown") });
 			return;
 		}
@@ -368,6 +384,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			return;
 		}
 		this.terminalCloseEmitted = true;
+		this.abortSnapshotTransfers(error);
 		void this.emit({ type: "closed", error: this.formatDaemonConnectionClosedError(error) });
 	}
 
@@ -593,9 +610,14 @@ export class DaemonAgentConnection implements AgentConnection {
 		const snapshotCursor = this.lastEventCursor;
 		const snapshotSequence = this.lastEventSequence;
 		const stateFreshnessGeneration = this.stateFreshnessGeneration;
-		const [state, sessionContextData] = await Promise.all([
+		const [state, messagesData, sessionContextData] = await Promise.all([
 			this.requestData<AgentConnectionState>(
 				{ type: "get_connection_state", activeSessionId: this.activeSessionId },
+				undefined,
+				options,
+			),
+			this.requestData<{ messages: AgentMessage[] }>(
+				{ type: "get_messages", activeSessionId: this.activeSessionId },
 				undefined,
 				options,
 			),
@@ -605,30 +627,12 @@ export class DaemonAgentConnection implements AgentConnection {
 				options,
 			),
 		]);
-		// get_session_context embeds the same transcript get_messages would
-		// return, so its messages are the snapshot transcript; only pay for the
-		// redundant second full-history frame when they are unexpectedly absent.
-		let sessionContext = sessionContextData.context;
-		let messages: AgentMessage[];
-		if (sessionContext && Array.isArray(sessionContext.messages)) {
-			messages = sessionContext.messages;
-		} else {
-			const messagesData = await this.requestData<{ messages: AgentMessage[] }>(
-				{ type: "get_messages", activeSessionId: this.activeSessionId },
-				undefined,
-				options,
-			);
-			messages = messagesData.messages;
-			if (sessionContext) {
-				sessionContext = { ...sessionContext, messages };
-			}
-		}
 		const children = this.latestSnapshot?.children;
 		const streamingMessage = this.latestSnapshot?.streamingMessage;
 		this.latestSnapshot = {
 			state,
-			messages,
-			sessionContext,
+			messages: messagesData.messages,
+			sessionContext: sessionContextData.context,
 			...(children ? { children } : {}),
 			...(streamingMessage ? { streamingMessage } : {}),
 		};
@@ -697,6 +701,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			.catch(async (error: unknown) => {
 				if (this.disposed || this.terminalCloseEmitted) return;
 				this.terminalCloseEmitted = true;
+				this.abortSnapshotTransfers(new Error("Failed to recover deferred session events"));
 				await this.emit({ type: "closed", error: `Failed to recover deferred session events: ${String(error)}` });
 			})
 			.finally(() => {
@@ -1534,10 +1539,12 @@ export class DaemonAgentConnection implements AgentConnection {
 		// The daemon streams the replacement snapshot (session_replaced plus
 		// chunked frames) while this switch runs, so it can land before or after
 		// the response. Expect it before sending the command so either order is
-		// observed; awaiting it keeps the history crossing the wire once.
-		const expectation = this.expectReplacementSnapshot();
+		// observed; awaiting it keeps the history crossing the wire once. The
+		// expectation carries the requested session so a replacement for any other
+		// session cannot settle this switch.
+		const expectation = this.expectReplacementSnapshot(sessionPath);
 		try {
-			const result = await this.requestData<{ cancelled: boolean }>({
+			const result = await this.requestData<{ cancelled: boolean; sessionFile?: string }>({
 				type: "switch_session",
 				activeSessionId: sourceActiveSessionId,
 				sessionPath,
@@ -1549,7 +1556,8 @@ export class DaemonAgentConnection implements AgentConnection {
 				return result;
 			}
 			await this.awaitReplacementSnapshot(expectation);
-			return result;
+			this.verifySwitchedSessionFile(sessionPath, result.sessionFile);
+			return { cancelled: false };
 		} catch (error) {
 			this.failReplacementSnapshot(expectation, "Session switch failed");
 			if (!(error instanceof SessionAlreadyActiveError) || !error.activeSessionId) {
@@ -1791,8 +1799,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		if (this.options.closeClientOnDispose) {
 			this.client.close();
 		}
-		this.rejectSnapshotAssemblies(new Error("Daemon connection disposed during snapshot transfer"));
-		this.failReplacementSnapshot(undefined, "Daemon connection disposed during a session switch");
+		this.abortSnapshotTransfers(new Error("Daemon connection disposed during snapshot transfer"));
 	}
 
 	async promoteToResident(): Promise<void> {
@@ -1899,6 +1906,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			if (!this.disposed && !this.terminalCloseEmitted) {
 				this.sessionInputPauses.clear();
 				this.sessionInputPauseGeneration++;
+				this.abortSnapshotTransfers(new Error(`Daemon reconnection failed: ${lastError.message}`));
 				this.client.close();
 				await this.emit({ type: "closed", error: `Daemon reconnection failed: ${lastError.message}` });
 			}
@@ -1979,16 +1987,18 @@ export class DaemonAgentConnection implements AgentConnection {
 		if (message.type === "session_snapshot_begin") {
 			const assembly = this.getSnapshotAssembly(message.snapshotId);
 			assembly.begin = message;
-			// A warm switch waits on exactly this streamed replacement snapshot.
-			// The resolve continuation runs after completeSnapshotAssembly applied
-			// the snapshot to the cache; any rejection settles the wait the other
-			// way so its caller falls back to refetching the transcript promptly.
+			// A warm switch waits on the replacement snapshot, or on the resync a
+			// reconnect produces for the same session. The assembler applies either one
+			// to the cache, which settles the wait; a failed stream settles it the other
+			// way so the caller falls back to refetching the transcript promptly.
 			const expectation = this.pendingReplacementSnapshot;
-			if (message.purpose === "replacement" && expectation) {
-				assembly.promise.then(
-					() => this.settleReplacementSnapshot(expectation),
-					(error: Error) => this.failReplacementSnapshot(expectation, error.message),
-				);
+			if ((message.purpose === "replacement" || message.purpose === "resync") && expectation) {
+				assembly.promise.catch((error: Error) => {
+					// An abandoned stream is not a failed replacement: the re-attach resync
+					// for the requested session settles the wait instead.
+					if (error instanceof SnapshotTransferAbandonedError) return;
+					this.failReplacementSnapshot(expectation, error.message);
+				});
 			}
 			return;
 		}
@@ -2101,7 +2111,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			this.childRosterSequence = undefined;
 			this.latestSnapshotIsFresh = true;
 			// The inline snapshot is fully applied: a waiting switch can proceed.
-			this.settleReplacementSnapshot();
+			this.settleReplacementSnapshot(undefined, message.state.sessionFile);
 			await this.emit({ type: "session_replaced", state: message.state, messages: message.messages });
 			return;
 		}
@@ -2123,7 +2133,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			}
 			this.terminalCloseEmitted = true;
 			const error = this.formatDaemonSessionClosedError(message.reason);
-			this.rejectSnapshotAssemblies(new Error(error));
+			this.abortSnapshotTransfers(new Error(error));
 			await this.emit({ type: "closed", error });
 		}
 	}
@@ -2193,6 +2203,7 @@ export class DaemonAgentConnection implements AgentConnection {
 				this.updateReconnectFailed = true;
 				if (!this.disposed && !this.terminalCloseEmitted) {
 					this.terminalCloseEmitted = true;
+					this.abortSnapshotTransfers(new Error("Daemon update restoration failed"));
 					await this.emit({
 						type: "closed",
 						error: this.formatUpdateReconnectError(error),
@@ -2302,6 +2313,16 @@ export class DaemonAgentConnection implements AgentConnection {
 		return assembly;
 	}
 
+	/**
+	 * A transfer that can no longer complete: reject every in-flight assembly and
+	 * release any switch waiting on the replacement stream they carried, so the
+	 * wait ends now instead of running out its timeout.
+	 */
+	private abortSnapshotTransfers(error: Error): void {
+		this.rejectSnapshotAssemblies(error);
+		this.failReplacementSnapshot(undefined, error.message);
+	}
+
 	private rejectSnapshotAssemblies(error: Error): void {
 		for (const assembly of this.snapshotAssemblies.values()) {
 			clearTimeout(assembly.timeout);
@@ -2354,6 +2375,7 @@ export class DaemonAgentConnection implements AgentConnection {
 				return;
 			}
 			this.terminalCloseEmitted = true;
+			this.abortSnapshotTransfers(new Error(`Failed to recover from a ${purpose} snapshot transfer`));
 			await this.emit({
 				type: "closed",
 				error: `Failed to recover from a ${purpose} snapshot transfer. Snapshot error: ${formatErrorSentence(snapshotError)} Recovery error: ${formatErrorSentence(recoveryError)} ${this.formatDaemonDiagnosticContext()}`,
@@ -2382,7 +2404,7 @@ export class DaemonAgentConnection implements AgentConnection {
 	 * on. The outbound session_replaced can arrive before or after the switch
 	 * response, so the expectation is registered before sending the command.
 	 */
-	private expectReplacementSnapshot(): ReplacementSnapshotExpectation {
+	private expectReplacementSnapshot(targetSessionFile?: string): ReplacementSnapshotExpectation {
 		// Rapid consecutive switches: the latest expectation wins and a stale
 		// one must never resolve the newer wait.
 		this.failReplacementSnapshot(undefined, "Session switch superseded by a newer switch");
@@ -2399,16 +2421,29 @@ export class DaemonAgentConnection implements AgentConnection {
 			promise,
 			resolve: resolveExpectation,
 			reject: rejectExpectation,
+			targetSessionFile,
 		};
 		this.pendingReplacementSnapshot = expectation;
 		return expectation;
 	}
 
-	/** Settle the pending switch wait once the replacement snapshot is applied. */
-	private settleReplacementSnapshot(expectation?: ReplacementSnapshotExpectation): void {
+	/**
+	 * Settle the pending switch wait once a replacement snapshot was applied.
+	 * `appliedSessionFile` is the session that replacement carried: a replacement
+	 * for another session (an earlier switch's late stream, or the replacement
+	 * another client's switch on this daemon session broadcast to this one) must
+	 * not leave the wrong transcript marked fresh, so the cache is not served and
+	 * the caller reloads the session this connection is on.
+	 */
+	private settleReplacementSnapshot(expectation?: ReplacementSnapshotExpectation, appliedSessionFile?: string): void {
 		const pending = this.pendingReplacementSnapshot;
 		if (!pending || (expectation && pending !== expectation)) return;
 		this.pendingReplacementSnapshot = undefined;
+		const target = pending.targetSessionFile;
+		if (target && (!appliedSessionFile || !isSameSessionTarget(target, appliedSessionFile))) {
+			this.latestSnapshotIsFresh = false;
+			this.latestSnapshotStateIsFresh = false;
+		}
 		pending.resolve();
 	}
 
@@ -2420,13 +2455,31 @@ export class DaemonAgentConnection implements AgentConnection {
 		pending.reject(new Error(reason));
 	}
 
+	/**
+	 * The switch response reports the session file the daemon resolved for the
+	 * request. A relative request cannot be compared against it before then, so a
+	 * snapshot of another session that a matching file name let through must not be
+	 * served as the switched transcript.
+	 */
+	private verifySwitchedSessionFile(requestedSessionFile: string, resolvedSessionFile?: string): void {
+		const applied = this.latestSnapshot?.state.sessionFile;
+		if (!applied) return;
+		// Without the daemon's resolution, only a request that names the file itself is
+		// trustworthy: a relative one was matched on its file name alone.
+		const unverified = resolvedSessionFile ? applied !== resolvedSessionFile : !isAbsolute(requestedSessionFile);
+		if (!unverified) return;
+		this.latestSnapshotIsFresh = false;
+		this.latestSnapshotStateIsFresh = false;
+	}
+
 	/** Bounded wait for the switch's replacement snapshot; any failure falls back to refetching. */
 	private async awaitReplacementSnapshot(expectation: ReplacementSnapshotExpectation): Promise<void> {
+		let timer: ReturnType<typeof setTimeout> | undefined;
 		try {
 			await Promise.race([
 				expectation.promise,
 				new Promise<never>((_, rejectTimeout) => {
-					const timer = setTimeout(
+					timer = setTimeout(
 						() => rejectTimeout(new Error("Timed out waiting for the streamed session replacement snapshot")),
 						this.options.snapshotTimeoutMs ?? DAEMON_SNAPSHOT_TIMEOUT_MS,
 					);
@@ -2440,6 +2493,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			// Invalidate it so the fetch fallback reloads the switched session.
 			this.latestSnapshotIsFresh = false;
 		} finally {
+			clearTimeout(timer);
 			this.failReplacementSnapshot(expectation, "Session switch wait ended");
 		}
 	}
@@ -2452,13 +2506,18 @@ export class DaemonAgentConnection implements AgentConnection {
 				assembly.begin.activeSessionId === this.activeSessionId,
 		);
 		if (pending.length === 0) return;
-		await Promise.race([
-			Promise.allSettled(pending.map((assembly) => assembly.promise)),
-			new Promise<void>((resolveTimer) => {
-				const timer = setTimeout(resolveTimer, this.options.snapshotTimeoutMs ?? DAEMON_SNAPSHOT_TIMEOUT_MS);
-				timer.unref();
-			}),
-		]);
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			await Promise.race([
+				Promise.allSettled(pending.map((assembly) => assembly.promise)),
+				new Promise<void>((resolveTimer) => {
+					timer = setTimeout(resolveTimer, this.options.snapshotTimeoutMs ?? DAEMON_SNAPSHOT_TIMEOUT_MS);
+					timer.unref();
+				}),
+			]);
+		} finally {
+			clearTimeout(timer);
+		}
 	}
 
 	private applySessionSnapshot(snapshot: DaemonSessionSnapshot, replay?: DaemonReplayInfo): void {
@@ -2475,6 +2534,10 @@ export class DaemonAgentConnection implements AgentConnection {
 		this.childRosterSequence = Array.isArray(snapshot.children) ? snapshot.lastEventSequence : undefined;
 		this.latestSnapshotIsFresh = true;
 		this.latestSnapshotStateIsFresh = true;
+		// The cache now holds this session, so a switch waiting on that session's
+		// replacement - including the resync a re-attach synthesizes locally, which
+		// never reaches the daemon-message path - can proceed.
+		this.settleReplacementSnapshot(undefined, snapshot.state.sessionFile);
 	}
 
 	private async completeSnapshotAssembly(
@@ -2728,6 +2791,31 @@ function getDaemonMessageCursor(message: DaemonOutbound): DaemonEventCursor | un
 		return undefined;
 	}
 	return message.meta?.cursor;
+}
+
+/**
+ * Is the replacement or resync that just arrived the one this switch asked for?
+ * Session files are compared as written, as resolved, and through symlinks, so a
+ * differently spelled path to the same file is not mistaken for another session.
+ * A relative request resolves against this process's cwd, which can differ from
+ * the daemon's, so its file name is the only identity both sides share - two
+ * sessions sharing a file name in different directories are then
+ * indistinguishable, which uniquely named session files make rare; anything else
+ * is another session's snapshot.
+ */
+function isSameSessionTarget(target: string, applied: string): boolean {
+	if (target === applied || resolve(target) === resolve(applied)) return true;
+	try {
+		if (realpathSync(target) === realpathSync(applied)) return true;
+	} catch {
+		// A path missing on this host (a remote daemon) proves nothing either way.
+	}
+	return !isAbsolute(target) && sessionFileName(target) === sessionFileName(applied);
+}
+
+/** The final segment of a path in either separator spelling. */
+function sessionFileName(file: string): string {
+	return basename(file.replaceAll("\\", "/"));
 }
 
 function invalidatesCachedSnapshot(commandType: DaemonCommandBody["type"]): boolean {
