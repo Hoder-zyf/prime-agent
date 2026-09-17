@@ -50,21 +50,27 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(side.metrics["switch_fetch"], [Observation(trial=0, value=1.0)])
         for _script, _metric, timeout in TRANSPORT_BENCHES:
             self.assertGreater(timeout, 0)
-        script, _metric, timeout = TRANSPORT_BENCHES[0]
-        run_as.assert_called_once_with(
-            "builder",
-            [
-                "node",
-                str(ROOT / script),
-                "--dist",
-                str(Path("/home/builder/source/packages/coding-agent/dist")),
-            ],
-            Path("/home/builder/source"),
-            timeout=timeout,
-            merge_output=True,
-        )
+        # The transport phase drives every registered bench, so the switch-fetch
+        # result and its sibling phase entries are recorded together.
+        self.assertEqual(run_as.call_count, len(TRANSPORT_BENCHES))
+        for script, _metric, timeout in TRANSPORT_BENCHES:
+            run_as.assert_any_call(
+                "builder",
+                [
+                    "node",
+                    str(ROOT / script),
+                    "--dist",
+                    str(Path("/home/builder/source/packages/coding-agent/dist")),
+                ],
+                Path("/home/builder/source"),
+                timeout=timeout,
+                merge_output=True,
+            )
         stop.assert_called_once()
-        self.assertEqual([path.name for path in saved], [f"{TRANSPORT_BENCHES[0][1]}-0.output"])
+        self.assertEqual(
+            sorted(path.name for path in saved),
+            sorted(f"{metric}-0.output" for _s, metric, _t in TRANSPORT_BENCHES),
+        )
 
     def test_records_the_harness_failure_and_keeps_the_sweep(self):
         side = Side(sha="a" * 40)

@@ -116,6 +116,14 @@ TRANSPORT_METRICS = (
         0.5,
         0,
     ),
+    Definition(
+        "frame_decode",
+        "Private frame decode, 32 MiB in 8 KiB chunks",
+        1000,
+        "ms",
+        0.02,
+        PERFORMANCE_NOISE_FLOOR,
+    ),
 )
 UI_METRICS = (
     Definition("resume_large", "Resume large session (cold)", 1000, "ms", 0.1, PERFORMANCE_NOISE_FLOOR),
@@ -417,6 +425,8 @@ def render(report: Report) -> str:
             "The switch benchmark drives one warm switch into a 48k-entry session through a real",
             "daemon and counts full-history crossings: streamed replacement snapshots, inline",
             "replacements, and full-history refetch responses.",
+            "Frame decode times one 32 MiB private frame, snapshot-chunk header, pushed in",
+            "8 KiB chunks; the wire shape of multi-MB frames on the daemon-worker channels.",
             "UI trials use a fresh fixture set: 194 top-level sessions including one ~40 MB transcript,",
             "40 ledger fan-out children, and a 6-deep subagent chain (~46 spawn edges).",
             "Large fixtures hold 1,999 complete triples (~5 MB JSONL); medium 119; subagents 399 each.",

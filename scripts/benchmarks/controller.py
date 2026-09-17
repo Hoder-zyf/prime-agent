@@ -33,6 +33,7 @@ FILES = (
     "worker.py",
     "ui.py",
     "switch-fetch-bench.mjs",
+    "frame-decode-bench.mjs",
     "pyproject.toml",
     "uv.lock",
 )
