@@ -112,6 +112,8 @@ describe("SessionManager append and tree traversal", () => {
 
 			session.branch(id2);
 			const id4 = session.appendMessage(userMsg("4-branch"));
+			session.branch(id2);
+			const id5 = session.appendMessage(userMsg("5-branch"));
 
 			const tree = session.getTree();
 			expect(tree).toHaveLength(1);
@@ -122,10 +124,10 @@ describe("SessionManager append and tree traversal", () => {
 
 			const node2 = root.children[0];
 			expect(node2.entry.id).toBe(id2);
-			expect(node2.children).toHaveLength(2); // id3 and id4 are siblings
+			expect(node2.children).toHaveLength(3); // id3, id4, and id5 are siblings
 
 			const childIds = node2.children.map((c) => c.entry.id).sort();
-			expect(childIds).toEqual([id3, id4].sort());
+			expect(childIds).toEqual([id3, id4, id5].sort());
 		});
 
 		it("handles deep branching", () => {
