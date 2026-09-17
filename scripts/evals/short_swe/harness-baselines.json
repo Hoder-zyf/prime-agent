@@ -1,38 +1,42 @@
 {
   "schema_version": 2,
   "description": "Static harness baselines on the 28-task Short SWE suite",
-  "model": "internal/glm-5.3-fast",
+  "model": "deepseek/deepseek-v4-flash",
+  "model_note": "Baselines measured on deepseek/deepseek-v4-flash; the paired evaluation uses internal/glm-5.3-fast. Same 15/8/5 taskset composition, re-selected task IDs.",
   "baselines": [
     {
       "harness": "pi-coding-harness",
       "label": "Pi coding harness",
       "tasksets": {
         "swebench-verified": {
-          "resolved": 0,
+          "resolved": 6,
           "tasks": 15,
           "uncached_input_tokens": 0,
           "cached_input_tokens": 0,
-          "output_tokens": 0
+          "output_tokens": 229520,
+          "measured": true
         },
         "swebench-pro": {
-          "resolved": 0,
+          "resolved": 4,
           "tasks": 8,
           "uncached_input_tokens": 0,
           "cached_input_tokens": 0,
-          "output_tokens": 0
+          "output_tokens": 0,
+          "measured": true
         },
         "scaleswe": {
-          "resolved": 0,
+          "resolved": 4,
           "tasks": 5,
           "uncached_input_tokens": 0,
           "cached_input_tokens": 0,
-          "output_tokens": 0
+          "output_tokens": 0,
+          "measured": true
         }
       },
       "model_failures": 0,
-      "e2e_seconds": 0.0,
-      "measured_at": "1970-01-01T00:00:00Z",
-      "source": "Pending measurement run"
+      "e2e_seconds": 7683.2,
+      "measured_at": "2026-09-02T00:00:00Z",
+      "source": "Sept 2026 campaign, deepseek/deepseek-v4-flash; mean 274.4 s/episode; input tokens not recorded"
     },
     {
       "harness": "codex",
@@ -43,58 +47,64 @@
           "tasks": 15,
           "uncached_input_tokens": 0,
           "cached_input_tokens": 0,
-          "output_tokens": 0
+          "output_tokens": 0,
+          "measured": false
         },
         "swebench-pro": {
           "resolved": 0,
           "tasks": 8,
           "uncached_input_tokens": 0,
           "cached_input_tokens": 0,
-          "output_tokens": 0
+          "output_tokens": 0,
+          "measured": false
         },
         "scaleswe": {
           "resolved": 0,
           "tasks": 5,
           "uncached_input_tokens": 0,
           "cached_input_tokens": 0,
-          "output_tokens": 0
+          "output_tokens": 0,
+          "measured": false
         }
       },
       "model_failures": 0,
       "e2e_seconds": 0.0,
       "measured_at": "1970-01-01T00:00:00Z",
-      "source": "Pending measurement run"
+      "source": "Not yet measured"
     },
     {
       "harness": "claude-code",
       "label": "Claude Code",
       "tasksets": {
         "swebench-verified": {
-          "resolved": 0,
+          "resolved": 7,
           "tasks": 15,
           "uncached_input_tokens": 0,
           "cached_input_tokens": 0,
-          "output_tokens": 0
+          "output_tokens": 289758,
+          "measured": true
         },
         "swebench-pro": {
-          "resolved": 0,
+          "resolved": 4,
           "tasks": 8,
           "uncached_input_tokens": 0,
           "cached_input_tokens": 0,
-          "output_tokens": 0
+          "output_tokens": 0,
+          "measured": true
         },
         "scaleswe": {
-          "resolved": 0,
+          "resolved": 4,
           "tasks": 5,
           "uncached_input_tokens": 0,
           "cached_input_tokens": 0,
-          "output_tokens": 0
+          "output_tokens": 0,
+          "measured": true
         }
       },
       "model_failures": 0,
-      "e2e_seconds": 0.0,
-      "measured_at": "1970-01-01T00:00:00Z",
-      "source": "Pending measurement run"
+      "e2e_seconds": 8461.6,
+      "measured_at": "2026-09-02T00:00:00Z",
+      "source": "Sept 2026 campaign, deepseek/deepseek-v4-flash; mean 302.2 s/episode; input tokens not recorded"
     },
     {
       "harness": "swe-agent",
@@ -105,58 +115,64 @@
           "tasks": 15,
           "uncached_input_tokens": 0,
           "cached_input_tokens": 0,
-          "output_tokens": 0
+          "output_tokens": 0,
+          "measured": false
         },
         "swebench-pro": {
           "resolved": 0,
           "tasks": 8,
           "uncached_input_tokens": 0,
           "cached_input_tokens": 0,
-          "output_tokens": 0
+          "output_tokens": 0,
+          "measured": false
         },
         "scaleswe": {
           "resolved": 0,
           "tasks": 5,
           "uncached_input_tokens": 0,
           "cached_input_tokens": 0,
-          "output_tokens": 0
+          "output_tokens": 0,
+          "measured": false
         }
       },
       "model_failures": 0,
       "e2e_seconds": 0.0,
       "measured_at": "1970-01-01T00:00:00Z",
-      "source": "Pending measurement run"
+      "source": "Not yet measured"
     },
     {
       "harness": "bash-edit",
       "label": "Bash Edit",
       "tasksets": {
         "swebench-verified": {
-          "resolved": 0,
+          "resolved": 8,
           "tasks": 15,
           "uncached_input_tokens": 0,
           "cached_input_tokens": 0,
-          "output_tokens": 0
+          "output_tokens": 194376,
+          "measured": true
         },
         "swebench-pro": {
-          "resolved": 0,
+          "resolved": 5,
           "tasks": 8,
           "uncached_input_tokens": 0,
           "cached_input_tokens": 0,
-          "output_tokens": 0
+          "output_tokens": 0,
+          "measured": true
         },
         "scaleswe": {
-          "resolved": 0,
+          "resolved": 4,
           "tasks": 5,
           "uncached_input_tokens": 0,
           "cached_input_tokens": 0,
-          "output_tokens": 0
+          "output_tokens": 0,
+          "measured": true
         }
       },
       "model_failures": 0,
-      "e2e_seconds": 0.0,
-      "measured_at": "1970-01-01T00:00:00Z",
-      "source": "Pending measurement run"
+      "e2e_seconds": 6750.8,
+      "measured_at": "2026-09-02T00:00:00Z",
+      "source": "Sept 2026 campaign, deepseek/deepseek-v4-flash; mean 241.1 s/episode; input tokens not recorded"
     }
   ]
 }
