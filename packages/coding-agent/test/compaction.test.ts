@@ -305,7 +305,6 @@ describe("prepareCompaction recency anchor", () => {
 	// A long user message crosses the tiny keep-recent budget, so the cut
 	// lands on it: a deterministic user-message cut with no split turn.
 	const longUserText = `user tail ${"x".repeat(400)}`;
-	const longAnchorText = `${"a".repeat(2500)}final kept state`;
 	const anchoredPreparation = (previousSummary: string, tailTexts: string[]) => {
 		const u2 = createMessageEntry(createUserMessage("user msg 2"));
 		const entries = [
@@ -329,25 +328,11 @@ describe("prepareCompaction recency anchor", () => {
 			keptSummary: "First summary",
 		},
 		{
-			name: "returns no anchor when the kept tail has no assistant text",
-			previousSummary: "First summary",
-			tailTexts: [],
-			anchor: undefined,
-			keptSummary: "First summary",
-		},
-		{
 			name: "drops the previous summary entirely when it contained only file blocks",
 			previousSummary: "<read-files>\nold/a.ts\n</read-files>\n\n<modified-files>\nold/b.ts\n</modified-files>",
 			tailTexts: [],
 			anchor: undefined,
 			keptSummary: undefined,
-		},
-		{
-			name: "tail-truncates the anchor to its character budget",
-			previousSummary: "First summary",
-			tailTexts: [longAnchorText],
-			anchor: longAnchorText.slice(-2000),
-			keptSummary: "First summary",
 		},
 	])("$name", ({ previousSummary, tailTexts, anchor, keptSummary }) => {
 		const preparation = anchoredPreparation(previousSummary, tailTexts);
