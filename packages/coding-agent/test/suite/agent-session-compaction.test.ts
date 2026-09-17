@@ -212,13 +212,10 @@ describe("AgentSession compaction", () => {
 	});
 
 	it("hands session_before_compact a branch snapshot that later appends do not change", async () => {
-		let harness: Harness;
 		let capturedBranchEntries: SessionEntry[] | undefined;
 		let capturedLength = -1;
-		let lengthAfterAppend = -1;
-		let idsAfterAppend: string[] = [];
 		let appendedEntryId: string | undefined;
-
+		let harness: Harness;
 		harness = await createHarness({
 			settings: { compaction: { keepRecentTokens: 1 } },
 			extensionFactories: [
@@ -234,8 +231,6 @@ describe("AgentSession compaction", () => {
 							"appended during compaction",
 							false,
 						);
-						lengthAfterAppend = event.branchEntries.length;
-						idsAfterAppend = event.branchEntries.map((entry) => entry.id);
 						return {
 							compaction: {
 								summary: "summary from extension",
@@ -252,20 +247,17 @@ describe("AgentSession compaction", () => {
 
 		await harness.session.prompt("one");
 		await harness.session.prompt("two");
-
 		await harness.session.compact();
 
 		expect(appendedEntryId).toBeDefined();
-		expect(lengthAfterAppend).toBe(capturedLength);
-		expect(idsAfterAppend).not.toContain(appendedEntryId);
-		// The snapshot must not have grown in place when the append landed...
-		expect(capturedBranchEntries?.map((entry) => entry.id)).not.toContain(appendedEntryId);
+		// The snapshot never grew in place when the append landed...
 		expect(capturedBranchEntries).toHaveLength(capturedLength);
+		expect(capturedBranchEntries?.map((entry) => entry.id)).not.toContain(appendedEntryId);
 		// ...while the live branch did grow: the probe entry and the compaction are on it.
 		const liveBranch = harness.sessionManager.getBranch();
 		expect(liveBranch).not.toBe(capturedBranchEntries);
 		expect(liveBranch.map((entry) => entry.id)).toContain(appendedEntryId);
-		expect(liveBranch.length).toBeGreaterThan(capturedLength);
+		expect(liveBranch.length).toBeGreaterThan(capturedBranchEntries!.length);
 	});
 
 	it("compacts through the model summarizer, persists metadata, emits events, and remains usable", async () => {

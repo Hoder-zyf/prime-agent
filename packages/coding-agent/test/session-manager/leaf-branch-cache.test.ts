@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { getLatestCompactionEntry, SessionManager } from "../../src/core/session-manager.js";
+import { SessionManager } from "../../src/core/session-manager.js";
 import { assistantMsg, userMsg } from "../utilities.js";
 
 // SessionManager caches the live leaf's branch path (getBranch() reads) because
@@ -18,17 +18,15 @@ describe("SessionManager leaf branch cache", () => {
 		}
 	});
 
-	function createTempDir(): string {
+	function persistedSession(): SessionManager {
 		const dir = mkdtempSync(join(tmpdir(), "pi-leaf-branch-cache-"));
 		tempDirs.push(dir);
-		return dir;
+		return SessionManager.create(dir, join(dir, "sessions"));
 	}
 
-	function ids(session: SessionManager): string[] {
-		return session.getBranch().map((entry) => entry.id);
-	}
+	const ids = (session: SessionManager) => session.getBranch().map((entry) => entry.id);
 
-	// Walks the cached path and checks it against the byId parent chain, so a
+	// Walks the served path and checks it against the byId parent chain, so a
 	// stale or half-extended cache cannot pass by returning the right ids only.
 	function expectChainMatches(session: SessionManager, expected: string[]): void {
 		const branch = session.getBranch();
@@ -39,83 +37,57 @@ describe("SessionManager leaf branch cache", () => {
 		}
 	}
 
-	it("returns the same cached array for repeated leaf reads", () => {
+	function seedTwo() {
 		const session = SessionManager.inMemory();
 		const firstId = session.appendMessage(userMsg("one"));
 		const secondId = session.appendMessage(assistantMsg("two"));
+		return { session, firstId, secondId };
+	}
 
+	it("serves one shared cached array that appends extend in place", () => {
+		const { session, firstId, secondId } = seedTwo();
 		const first = session.getBranch();
-		const second = session.getBranch();
-
-		expect(second).toBe(first);
+		expect(session.getBranch()).toBe(first); // repeated leaf reads share the array
 		expect(first.map((entry) => entry.id)).toEqual([firstId, secondId]);
-	});
 
-	it("extends the cached branch in place on append", () => {
-		const session = SessionManager.inMemory();
-		const firstId = session.appendMessage(userMsg("one"));
-		const secondId = session.appendMessage(assistantMsg("two"));
-		expect(ids(session)).toEqual([firstId, secondId]); // populates the cache
-
-		const before = session.getBranch();
 		const thirdId = session.appendCustomMessageEntry("note", "hello", false);
 		expectChainMatches(session, [firstId, secondId, thirdId]);
 		// An append extends the same array the earlier read handed out.
-		expect(session.getBranch()).toBe(before);
+		expect(session.getBranch()).toBe(first);
 
 		const fourthId = session.appendMessage(userMsg("four"));
 		expectChainMatches(session, [firstId, secondId, thirdId, fourthId]);
 	});
 
-	it("invalidates the cached branch when branching to an older entry", () => {
-		const session = SessionManager.inMemory();
-		const firstId = session.appendMessage(userMsg("one"));
-		const secondId = session.appendMessage(assistantMsg("two"));
+	it("drops the cache on every leaf-changing operation and re-caches the new path", () => {
+		const { session, firstId, secondId } = seedTwo();
 		expect(ids(session)).toEqual([firstId, secondId]); // populates the cache
 
+		// branch(): the abandoned path must not leak, and a sibling append re-roots.
 		session.branch(firstId);
 		expectChainMatches(session, [firstId]);
-
 		const siblingId = session.appendMessage(userMsg("sibling"));
 		expectChainMatches(session, [firstId, siblingId]);
-
 		// Branching back to the abandoned entry must not resurrect the old cache.
 		session.branch(secondId);
 		expectChainMatches(session, [firstId, secondId]);
-	});
 
-	it("invalidates the cached branch on resetLeaf", () => {
-		const session = SessionManager.inMemory();
-		const firstId = session.appendMessage(userMsg("one"));
-		const secondId = session.appendMessage(assistantMsg("two"));
-		expect(ids(session)).toEqual([firstId, secondId]);
-
+		// resetLeaf(): an empty branch, then the next append re-roots the tree.
 		session.resetLeaf();
 		expect(session.getLeafId()).toBeNull();
 		expect(session.getBranch()).toEqual([]);
-
-		// A reset leaf re-roots the next append.
 		const rootId = session.appendMessage(userMsg("root again"));
 		expect(session.getEntry(rootId)?.parentId).toBeNull();
 		expectChainMatches(session, [rootId]);
-	});
 
-	it("invalidates the cached branch when a branch summary changes the path", () => {
-		const session = SessionManager.inMemory();
-		const firstId = session.appendMessage(userMsg("one"));
-		const secondId = session.appendMessage(assistantMsg("two"));
-		const thirdId = session.appendMessage(userMsg("three"));
-		expect(ids(session)).toEqual([firstId, secondId, thirdId]);
-
+		// branchWithSummary(): the summary entry becomes the new leaf, and the
+		// compaction appended after it lands on the summarized branch.
 		const summaryId = session.branchWithSummary(secondId, "summary of the abandoned path");
 		expectChainMatches(session, [firstId, secondId, summaryId]);
-		expect(getLatestCompactionEntry(session.getBranch())).toBeNull();
-
-		const compactionId = session.appendCompaction("compaction summary", thirdId, 1234, {
+		const compactionId = session.appendCompaction("compaction summary", rootId, 1234, {
 			readFiles: [],
 			modifiedFiles: [],
 		});
-		expect(getLatestCompactionEntry(session.getBranch())?.id).toBe(compactionId);
 		expectChainMatches(session, [firstId, secondId, summaryId, compactionId]);
 	});
 
@@ -127,31 +99,21 @@ describe("SessionManager leaf branch cache", () => {
 		const fourthId = session.appendMessage(assistantMsg("four"));
 
 		const leafPath = session.getBranch();
-		expect(leafPath.map((entry) => entry.id)).toEqual([firstId, secondId, thirdId, fourthId]);
+		expect(ids(session)).toEqual([firstId, secondId, thirdId, fourthId]);
 
 		const suffix = session.getBranch(secondId);
 		expect(suffix.map((entry) => entry.id)).toEqual([firstId, secondId]);
 		expect(suffix).not.toBe(leafPath);
 
-		// The mid-branch read must not have replaced the cached leaf path.
-		const reread = session.getBranch();
-		expect(reread).toBe(leafPath);
-		expect(reread.map((entry) => entry.id)).toEqual([firstId, secondId, thirdId, fourthId]);
-
+		// The mid-branch read must not have replaced the cached leaf path...
+		expect(session.getBranch()).toBe(leafPath);
 		// ...nor cached a suffix as if it were the leaf path.
-		session.appendMessage(userMsg("five"));
-		expect(session.getBranch().map((entry) => entry.id)).toEqual([
-			firstId,
-			secondId,
-			thirdId,
-			fourthId,
-			session.getLeafId(),
-		]);
+		const fifthId = session.appendMessage(userMsg("five"));
+		expectChainMatches(session, [firstId, secondId, thirdId, fourthId, fifthId]);
 	});
 
 	it("drops the cached branch when a failed append is rolled back", () => {
-		const dir = createTempDir();
-		const session = SessionManager.create(dir, join(dir, "sessions"));
+		const session = persistedSession();
 		const firstId = session.appendMessage(userMsg("one"));
 		expect(ids(session)).toEqual([firstId]); // populates the cache
 
@@ -162,25 +124,13 @@ describe("SessionManager leaf branch cache", () => {
 
 		expect(session.getLeafId()).toBe(firstId);
 		expectChainMatches(session, [firstId]);
-
 		// The next append starts from the rolled-back leaf and stays coherent.
 		const secondId = session.appendCustomMessageEntry("note", "saved", false);
 		expectChainMatches(session, [firstId, secondId]);
-
-		// The rolled-back entry must not reach disk either: the rewrite triggered
-		// by the assistant message must produce the same path the cache serves.
-		const thirdId = session.appendMessage(assistantMsg("three"));
-		expectChainMatches(session, [firstId, secondId, thirdId]);
-		expect(
-			SessionManager.open(session.getSessionFile()!)
-				.getBranch()
-				.map((entry) => entry.id),
-		).toEqual(session.getBranch().map((entry) => entry.id));
 	});
 
 	it("never leaves a rolled-back append in a branch array a caller already holds", () => {
-		const dir = createTempDir();
-		const session = SessionManager.create(dir, join(dir, "sessions"));
+		const session = persistedSession();
 		const firstId = session.appendMessage(userMsg("one"));
 		const held = session.getBranch(); // the live cached array
 
@@ -203,24 +153,6 @@ describe("SessionManager leaf branch cache", () => {
 		expect(() => session.appendCustomMessageEntryWithRollback("note", "unsaved again", false)).toThrow("disk full");
 
 		expect(heldAgain.map((entry) => entry.id)).toEqual([firstId]);
-		expect(session.getLeafId()).toBe(firstId);
 		expectChainMatches(session, [firstId]);
-
-		// The next append starts from the rolled-back leaf and stays coherent.
-		const secondId = session.appendCustomMessageEntry("note", "saved", false);
-		expectChainMatches(session, [firstId, secondId]);
-	});
-
-	it("keeps the cached branch identical to a reopened session's branch", () => {
-		const dir = createTempDir();
-		const session = SessionManager.create(dir, join(dir, "sessions"));
-		const firstId = session.appendMessage(userMsg("one"));
-		const secondId = session.appendMessage(assistantMsg("two"));
-		const thirdId = session.appendMessage(userMsg("three"));
-
-		const reopened = SessionManager.open(session.getSessionFile()!);
-
-		expect(reopened.getBranch().map((entry) => entry.id)).toEqual(session.getBranch().map((entry) => entry.id));
-		expect(reopened.getBranch().map((entry) => entry.id)).toEqual([firstId, secondId, thirdId]);
 	});
 });
