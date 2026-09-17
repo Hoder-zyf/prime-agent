@@ -266,7 +266,7 @@ describe("AgentSession compaction", () => {
 		expect(liveBranch).not.toBe(capturedBranchEntries);
 		expect(liveBranch.map((entry) => entry.id)).toContain(appendedEntryId);
 		expect(liveBranch.length).toBeGreaterThan(capturedLength);
-	}, 30_000);
+	});
 
 	it("compacts through the model summarizer, persists metadata, emits events, and remains usable", async () => {
 		const harness = await createHarness({
