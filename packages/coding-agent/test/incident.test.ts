@@ -40,50 +40,71 @@ function reportFor(lines: string[], options: { since?: number; until?: number; s
 	);
 }
 
+/** Supervisor-side log line (daemon-supervisor component). */
+function supervisorLine(ts: string, msg: string, extra: Record<string, unknown> = {}): string {
+	return agentLogLine({ ts, component: "coding-agent.daemon-supervisor", ...extra, msg });
+}
+
+/** Worker daemon startup line, the pid sighting that anchors attribution. */
+function workerStartLine(ts: string, socketPath: string, pid: number): string {
+	return agentLogLine({
+		ts,
+		component: "coding-agent.daemon",
+		socketPath,
+		pid,
+		msg: `Prime Agent daemon listening on ${socketPath}`,
+	});
+}
+
+/** Worker daemon log line for a worker running under the fixture pid. */
+function daemonLine(ts: string, socketPath: string, msg: string): string {
+	return agentLogLine({ ts, component: "coding-agent.daemon", socketPath, pid: 53615, msg });
+}
+
+/** Provider stream failure line (rate_limit 429) attributed by pid. */
+function providerFailureLine(ts: string, pid: number): string {
+	return agentLogLine({
+		ts,
+		level: "error",
+		component: "ai.provider",
+		pid,
+		msg: "provider stream failure",
+		kind: "rate_limit",
+		status: 429,
+	});
+}
+
 // ---------------------------------------------------------------------------
 // Green run: normal startup, worker start/stop, no errors.
 // ---------------------------------------------------------------------------
 
 describe("incident timeline for a clean run", () => {
 	it("shows supervisor and worker events with no anomaly entries", () => {
-		const text = reportFor([
-			agentLogLine({
-				ts: "2026-09-10T20:00:05.000Z",
-				component: "coding-agent.daemon-supervisor",
-				msg: "Prime Agent daemon supervisor e14de15c listening on /tmp/prime-agent-501/daemon.sock",
-				pid: 15026,
-			}),
-			agentLogLine({
-				ts: "2026-09-10T20:01:00.000Z",
-				component: "coding-agent.daemon-supervisor",
-				msg: "Session worker 477fef4e85a8 stderr: Prime Agent daemon listening on /tmp/prime-agent-501/worker-a-477fef4e85a8.sock",
-				pid: 15026,
-			}),
-			agentLogLine({
-				ts: "2026-09-10T20:02:00.000Z",
-				component: "coding-agent.daemon-supervisor",
-				msg: "Migrated 2 scheduled jobs into session artifacts",
-				pid: 15026,
-			}),
-			agentLogLine({
-				ts: "2026-09-10T20:10:00.000Z",
-				component: "coding-agent.daemon-supervisor",
-				msg: "Session worker 477fef4e85a8 stderr: shutdown command received over socket; 1 active session(s) will be closed",
-				pid: 15026,
-			}),
-			agentLogLine({
-				ts: "2026-09-10T20:10:01.000Z",
-				component: "coding-agent.daemon-supervisor",
-				msg: "Session worker 477fef4e85a8 stderr: shutting down (exit 0); closing 1 active session(s)",
-				pid: 15026,
-			}),
-			agentLogLine({
-				ts: "2026-09-10T20:11:00.000Z",
-				component: "coding-agent.daemon-supervisor",
-				msg: "Evicted empty session worker 477fef4e85a8 root=01a0-abc on last client detach",
-				pid: 15026,
-			}),
-		]);
+		const text = reportFor(
+			[
+				[
+					"2026-09-10T20:00:05.000Z",
+					"Prime Agent daemon supervisor e14de15c listening on /tmp/prime-agent-501/daemon.sock",
+				],
+				[
+					"2026-09-10T20:01:00.000Z",
+					"Session worker 477fef4e85a8 stderr: Prime Agent daemon listening on /tmp/prime-agent-501/worker-a-477fef4e85a8.sock",
+				],
+				["2026-09-10T20:02:00.000Z", "Migrated 2 scheduled jobs into session artifacts"],
+				[
+					"2026-09-10T20:10:00.000Z",
+					"Session worker 477fef4e85a8 stderr: shutdown command received over socket; 1 active session(s) will be closed",
+				],
+				[
+					"2026-09-10T20:10:01.000Z",
+					"Session worker 477fef4e85a8 stderr: shutting down (exit 0); closing 1 active session(s)",
+				],
+				[
+					"2026-09-10T20:11:00.000Z",
+					"Evicted empty session worker 477fef4e85a8 root=01a0-abc on last client detach",
+				],
+			].map(([ts, msg]) => supervisorLine(ts, msg, { pid: 15026 })),
+		);
 		expect(text).toContain("Supervisor events");
 		expect(text).toContain("worker 477fef4e85a8 started");
 		expect(text).toContain("worker 477fef4e85a8 stop requested (1 active session(s))");
@@ -114,14 +135,9 @@ function incidentFixtureLines(): string[] {
 		socketPath: "/tmp/prime-agent-501/worker-98ed5cb228d2-5b1d3aeb91ee.sock",
 		pid: 53615,
 	};
+	const supervisorMsg = (ts: string, msg: string) => agentLogLine({ ...supervisor, ts, msg });
 	// Worker starts before the window; provider failures are attributed to it by pid.
-	lines.push(
-		agentLogLine({
-			...crashedWorker,
-			ts: "2026-09-10T19:42:09.064Z",
-			msg: "Prime Agent daemon listening on /tmp/prime-agent-501/worker-98ed5cb228d2-5b1d3aeb91ee.sock",
-		}),
-	);
+	lines.push(workerStartLine("2026-09-10T19:42:09.064Z", crashedWorker.socketPath, 53615));
 	// Attach timeouts 20:02-20:21.
 	for (const [ts, command] of [
 		["2026-09-10T20:02:39.764Z", "attach"],
@@ -130,41 +146,36 @@ function incidentFixtureLines(): string[] {
 		["2026-09-10T20:21:53.062Z", "attach"],
 	] as const) {
 		lines.push(
-			agentLogLine({
-				...supervisor,
+			supervisorMsg(
 				ts,
-				msg: `Supervisor command ${command} failed: Error: Timed out waiting for daemon worker response to ${command}\n    at Timeout._onTimeout (node:internal/timers:618:7)`,
-			}),
+				`Supervisor command ${command} failed: Error: Timed out waiting for daemon worker response to ${command}\n    at Timeout._onTimeout (node:internal/timers:618:7)`,
+			),
 		);
 	}
 	// Per-session catch-up timeouts for 2339fb7da605 and one other session.
 	lines.push(
-		agentLogLine({
-			...supervisor,
-			ts: "2026-09-10T20:02:33.708Z",
-			msg: "Failed to catch up client daemon-client:ac0fbf2a for dcdced964c0d: Error: Timed out waiting for daemon worker response to attach",
-		}),
+		supervisorMsg(
+			"2026-09-10T20:02:33.708Z",
+			"Failed to catch up client daemon-client:ac0fbf2a for dcdced964c0d: Error: Timed out waiting for daemon worker response to attach",
+		),
 	);
 	for (const ts of ["2026-09-10T20:04:50.397Z", "2026-09-10T20:11:29.190Z", "2026-09-10T20:14:57.615Z"]) {
 		lines.push(
-			agentLogLine({
-				...supervisor,
+			supervisorMsg(
 				ts,
-				msg: "Failed to catch up client daemon-client:dc5ad892 for 2339fb7da605: Error: Timed out waiting for daemon worker response to attach",
-			}),
+				"Failed to catch up client daemon-client:dc5ad892 for 2339fb7da605: Error: Timed out waiting for daemon worker response to attach",
+			),
 		);
 	}
 	lines.push(
-		agentLogLine({
-			...supervisor,
-			ts: "2026-09-10T20:21:58.137Z",
-			msg: "Could not list heartbeats from a worker: Timed out waiting for daemon worker response to heartbeats_list",
-		}),
-		agentLogLine({
-			...supervisor,
-			ts: "2026-09-10T20:02:30.000Z",
-			msg: "Supervisor command list_agent_peers failed: Error: Worker authentication failed\n    at handleCommand (chunk.js:1:1)",
-		}),
+		supervisorMsg(
+			"2026-09-10T20:21:58.137Z",
+			"Could not list heartbeats from a worker: Timed out waiting for daemon worker response to heartbeats_list",
+		),
+		supervisorMsg(
+			"2026-09-10T20:02:30.000Z",
+			"Supervisor command list_agent_peers failed: Error: Worker authentication failed\n    at handleCommand (chunk.js:1:1)",
+		),
 	);
 	// Provider stream failures from the overloaded worker (real entries carry
 	// only the worker pid, no socket path).
@@ -188,16 +199,14 @@ function incidentFixtureLines(): string[] {
 			ts: "2026-09-10T20:23:24.945Z",
 			msg: "uncaught exception: Error: write EPIPE\n    at afterWriteDispatched (node:internal/stream_base_commons:159:15)",
 		}),
-		agentLogLine({
-			...supervisor,
-			ts: "2026-09-10T20:23:24.945Z",
-			msg: "Session worker 5b1d3aeb91ee stderr: uncaught exception: Error: write EPIPE",
-		}),
-		agentLogLine({
-			...supervisor,
-			ts: "2026-09-10T20:23:24.946Z",
-			msg: "Session worker 5b1d3aeb91ee stderr:     at afterWriteDispatched (node:internal/stream_base_commons:159:15)",
-		}),
+		supervisorMsg(
+			"2026-09-10T20:23:24.945Z",
+			"Session worker 5b1d3aeb91ee stderr: uncaught exception: Error: write EPIPE",
+		),
+		supervisorMsg(
+			"2026-09-10T20:23:24.946Z",
+			"Session worker 5b1d3aeb91ee stderr:     at afterWriteDispatched (node:internal/stream_base_commons:159:15)",
+		),
 	);
 	// Recovery: worker replaced, backlogged uncertain operations held.
 	const operations = [
@@ -207,16 +216,14 @@ function incidentFixtureLines(): string[] {
 		...Array<string>(16).fill("message_start"),
 	].join(", ");
 	lines.push(
-		agentLogLine({
-			...supervisor,
-			ts: "2026-09-10T20:23:29.521Z",
-			msg: `Recovered worker 5b1d3aeb91ee without replaying uncertain operations: ${operations}`,
-		}),
-		agentLogLine({
-			...supervisor,
-			ts: "2026-09-10T20:23:39.520Z",
-			msg: "Could not adopt worker 5b1d3aeb91ee: Error: Session worker process is no longer running",
-		}),
+		supervisorMsg(
+			"2026-09-10T20:23:29.521Z",
+			`Recovered worker 5b1d3aeb91ee without replaying uncertain operations: ${operations}`,
+		),
+		supervisorMsg(
+			"2026-09-10T20:23:39.520Z",
+			"Could not adopt worker 5b1d3aeb91ee: Error: Session worker process is no longer running",
+		),
 	);
 	return lines;
 }
@@ -281,11 +288,10 @@ describe("incident window and session filtering", () => {
 	it("matches session names quoted in log messages", () => {
 		const text = reportFor(
 			[
-				agentLogLine({
-					component: "coding-agent.daemon-supervisor",
-					ts: "2026-09-10T20:05:00.000Z",
-					msg: 'Supervisor command set_session_name failed: Error: Agent name "Faerie" is unavailable',
-				}),
+				supervisorLine(
+					"2026-09-10T20:05:00.000Z",
+					'Supervisor command set_session_name failed: Error: Agent name "Faerie" is unavailable',
+				),
 			],
 			{ session: "Faerie" },
 		);
@@ -297,13 +303,11 @@ describe("incident window and session filtering", () => {
 		// token must not prefix-match every --session value.
 		const text = reportFor(
 			[
-				agentLogLine({
-					ts: "2026-09-10T20:05:00.000Z",
-					component: "coding-agent.daemon",
-					socketPath: "/tmp/prime-agent-501/worker-98ed5cb228d2-5b1d3aeb91ee.sock",
-					pid: 53615,
-					msg: 'Passivated idle child sessionId=feedface1234 name="" idleMinutes=5',
-				}),
+				daemonLine(
+					"2026-09-10T20:05:00.000Z",
+					"/tmp/prime-agent-501/worker-98ed5cb228d2-5b1d3aeb91ee.sock",
+					'Passivated idle child sessionId=feedface1234 name="" idleMinutes=5',
+				),
 			],
 			{ session: "aabbccddeeff" },
 		);
@@ -313,13 +317,11 @@ describe("incident window and session filtering", () => {
 	it("keeps session tokens from worker command failures", () => {
 		const text = reportFor(
 			[
-				agentLogLine({
-					ts: "2026-09-10T20:05:00.000Z",
-					component: "coding-agent.daemon",
-					socketPath: "/tmp/prime-agent-501/worker-98ed5cb228d2-5b1d3aeb91ee.sock",
-					pid: 53615,
-					msg: 'daemon command "set_session_name" failed: Error: Agent name "Faerie" is unavailable',
-				}),
+				daemonLine(
+					"2026-09-10T20:05:00.000Z",
+					"/tmp/prime-agent-501/worker-98ed5cb228d2-5b1d3aeb91ee.sock",
+					'daemon command "set_session_name" failed: Error: Agent name "Faerie" is unavailable',
+				),
 			],
 			{ session: "Faerie" },
 		);
@@ -456,11 +458,10 @@ describe("runIncident over a fixture agent dir", () => {
 		const contents = [
 			"this is not json",
 			JSON.stringify({ noTs: true, msg: "missing ts" }),
-			agentLogLine({
-				ts: "2026-09-10T20:02:39.764Z",
-				component: "coding-agent.daemon-supervisor",
-				msg: "Supervisor command attach failed: Error: Timed out waiting for daemon worker response to attach",
-			}),
+			supervisorLine(
+				"2026-09-10T20:02:39.764Z",
+				"Supervisor command attach failed: Error: Timed out waiting for daemon worker response to attach",
+			),
 			"",
 		].join("\n");
 		writeFileSync(join(agentDir, "logs", "agent.jsonl"), `${contents}\n`);
@@ -511,11 +512,7 @@ describe("runIncident over a fixture agent dir", () => {
 		mkdirSync(join(agentDir, "logs"), { recursive: true });
 		writeFileSync(
 			join(agentDir, "logs", "agent.jsonl"),
-			`${agentLogLine({
-				ts: "2026-09-10T20:02:39.764Z",
-				component: "coding-agent.daemon-supervisor",
-				msg: "Supervisor command attach failed: Error: Timed out waiting for daemon worker response to attach",
-			})}\n`,
+			`${supervisorLine("2026-09-10T20:02:39.764Z", "Supervisor command attach failed: Error: Timed out waiting for daemon worker response to attach")}\n`,
 		);
 		await runIncident(
 			{},
@@ -551,11 +548,10 @@ describe("runIncident over a fixture agent dir", () => {
 
 	it("does not fall back when agent.jsonl parses but has no in-window events", async () => {
 		mkdirSync(join(agentDir, "logs"), { recursive: true });
-		const outOfWindow = agentLogLine({
-			ts: "2026-09-01T10:00:00.000Z",
-			component: "coding-agent.daemon-supervisor",
-			msg: "Supervisor command attach failed: Error: Timed out waiting for daemon worker response to attach",
-		});
+		const outOfWindow = supervisorLine(
+			"2026-09-01T10:00:00.000Z",
+			"Supervisor command attach failed: Error: Timed out waiting for daemon worker response to attach",
+		);
 		writeFileSync(join(agentDir, "logs", "agent.jsonl"), `${outOfWindow}\n`);
 		writeFileSync(
 			join(agentDir, "logs", "daemon.sock.98ed5cb2.log"),
@@ -582,22 +578,12 @@ describe("runIncident over a fixture agent dir", () => {
 describe("worker pid attribution and anomalies", () => {
 	it("attributes provider failures to the worker that owns the pid", () => {
 		const lines = [
-			agentLogLine({
-				ts: "2026-09-10T19:42:09.064Z",
-				component: "coding-agent.daemon",
-				socketPath: "/tmp/prime-agent-501/worker-98ed5cb228d2-5b1d3aeb91ee.sock",
-				pid: 53615,
-				msg: "Prime Agent daemon listening on /tmp/prime-agent-501/worker-98ed5cb228d2-5b1d3aeb91ee.sock",
-			}),
-			agentLogLine({
-				ts: "2026-09-10T20:02:53.374Z",
-				level: "error",
-				component: "ai.provider",
-				pid: 53615,
-				msg: "provider stream failure",
-				kind: "rate_limit",
-				status: 429,
-			}),
+			workerStartLine(
+				"2026-09-10T19:42:09.064Z",
+				"/tmp/prime-agent-501/worker-98ed5cb228d2-5b1d3aeb91ee.sock",
+				53615,
+			),
+			providerFailureLine("2026-09-10T20:02:53.374Z", 53615),
 		];
 		const entries = lines.map((line) => entry(line));
 		const events = collectIncidentEvents(entries, collectWorkerPidMap(entries));
@@ -634,11 +620,11 @@ describe("worker pid attribution and anomalies", () => {
 		] as const;
 		const text = reportFor(
 			times.map(([daemon, time]) =>
-				agentLogLine({
-					...daemon,
-					ts: `2026-09-10T${time}:00.000Z`,
-					msg: "Supervisor command attach failed: Error: Timed out waiting for daemon worker response to attach",
-				}),
+				supervisorLine(
+					`2026-09-10T${time}:00.000Z`,
+					"Supervisor command attach failed: Error: Timed out waiting for daemon worker response to attach",
+					daemon,
+				),
 			),
 		);
 		expect(text).toContain("/tmp/prime-agent-501/daemon.sock: 4 command timeouts over 19m");
@@ -666,39 +652,11 @@ describe("worker pid attribution and anomalies", () => {
 		const workerA = "/tmp/prime-agent-501/worker-98ed5cb228d2-aaaaaaaaaaaa.sock";
 		const workerB = "/tmp/prime-agent-501/worker-98ed5cb228d2-bbbbbbbbbbbb.sock";
 		const lines = [
-			agentLogLine({
-				ts: "2026-09-10T20:00:00.000Z",
-				component: "coding-agent.daemon",
-				socketPath: workerA,
-				pid: 53615,
-				msg: `Prime Agent daemon listening on ${workerA}`,
-			}),
-			agentLogLine({
-				ts: "2026-09-10T20:01:00.000Z",
-				level: "error",
-				component: "ai.provider",
-				pid: 53615,
-				msg: "provider stream failure",
-				kind: "rate_limit",
-				status: 429,
-			}),
+			workerStartLine("2026-09-10T20:00:00.000Z", workerA, 53615),
+			providerFailureLine("2026-09-10T20:01:00.000Z", 53615),
 			// The same pid is reused by a replacement worker an hour later.
-			agentLogLine({
-				ts: "2026-09-10T21:00:00.000Z",
-				component: "coding-agent.daemon",
-				socketPath: workerB,
-				pid: 53615,
-				msg: `Prime Agent daemon listening on ${workerB}`,
-			}),
-			agentLogLine({
-				ts: "2026-09-10T21:01:00.000Z",
-				level: "error",
-				component: "ai.provider",
-				pid: 53615,
-				msg: "provider stream failure",
-				kind: "rate_limit",
-				status: 429,
-			}),
+			workerStartLine("2026-09-10T21:00:00.000Z", workerB, 53615),
+			providerFailureLine("2026-09-10T21:01:00.000Z", 53615),
 		];
 		const entries = lines.map((line) => entry(line));
 		const events = collectIncidentEvents(entries, collectWorkerPidMap(entries));
@@ -712,24 +670,8 @@ describe("worker pid attribution and anomalies", () => {
 	it("classifies worker events for Windows named-pipe socket paths", () => {
 		const socketPath = "\\\\.\\pipe\\prime-agent-worker-98ed5cb228d2-5b1d3aeb91ee";
 		const entries = [
-			entry(
-				agentLogLine({
-					ts: "2026-09-10T20:00:00.000Z",
-					component: "coding-agent.daemon",
-					socketPath,
-					pid: 53615,
-					msg: `Prime Agent daemon listening on ${socketPath}`,
-				}),
-			),
-			entry(
-				agentLogLine({
-					ts: "2026-09-10T20:23:24.945Z",
-					component: "coding-agent.daemon",
-					socketPath,
-					pid: 53615,
-					msg: "uncaught exception: Error: write EPIPE",
-				}),
-			),
+			entry(workerStartLine("2026-09-10T20:00:00.000Z", socketPath, 53615)),
+			entry(daemonLine("2026-09-10T20:23:24.945Z", socketPath, "uncaught exception: Error: write EPIPE")),
 		];
 		const events = collectIncidentEvents(entries, collectWorkerPidMap(entries));
 		expect(events.map((item) => item.eventClass)).toEqual(["worker-start", "worker-crash"]);
@@ -739,15 +681,7 @@ describe("worker pid attribution and anomalies", () => {
 	it("keys unknown worker diagnostics as worker events", () => {
 		const socketPath = "/tmp/prime-agent-501/worker-98ed5cb228d2-aaaaaaaaaaaa.sock";
 		const entries = [1, 2, 3].map((index) =>
-			entry(
-				agentLogLine({
-					ts: `2026-09-10T20:0${index}:00.000Z`,
-					component: "coding-agent.daemon",
-					socketPath,
-					pid: 53615,
-					msg: `unrecognized worker diagnostic ${index}`,
-				}),
-			),
+			entry(daemonLine(`2026-09-10T20:0${index}:00.000Z`, socketPath, `unrecognized worker diagnostic ${index}`)),
 		);
 		const events = collectIncidentEvents(entries, collectWorkerPidMap(entries));
 		const anomalies = computeIncidentAnomalies(events);
@@ -760,24 +694,10 @@ describe("worker pid attribution and anomalies", () => {
 	it("does not attribute a provider failure to a worker sighted later on the pid", () => {
 		const workerB = "/tmp/prime-agent-501/worker-98ed5cb228d2-bbbbbbbbbbbb.sock";
 		const lines = [
-			agentLogLine({
-				ts: "2026-09-10T10:00:00.000Z",
-				level: "error",
-				component: "ai.provider",
-				pid: 53615,
-				msg: "provider stream failure",
-				kind: "rate_limit",
-				status: 429,
-			}),
+			providerFailureLine("2026-09-10T10:00:00.000Z", 53615),
 			// The pid's only sighting is a worker that starts ten minutes later;
 			// a future sighting is never evidence of ownership at 10:00.
-			agentLogLine({
-				ts: "2026-09-10T10:10:00.000Z",
-				component: "coding-agent.daemon",
-				socketPath: workerB,
-				pid: 53615,
-				msg: `Prime Agent daemon listening on ${workerB}`,
-			}),
+			workerStartLine("2026-09-10T10:10:00.000Z", workerB, 53615),
 		];
 		const entries = lines.map((line) => entry(line));
 		const events = collectIncidentEvents(entries, collectWorkerPidMap(entries));
@@ -788,11 +708,10 @@ describe("worker pid attribution and anomalies", () => {
 	it("flags error bursts that are not timeouts", () => {
 		const entries = [1, 2, 3].map((index) =>
 			entry(
-				agentLogLine({
-					ts: `2026-09-10T20:0${index}:00.000Z`,
-					component: "coding-agent.daemon-supervisor",
-					msg: `Supervisor command send_message failed: Error: Unknown active session: aabbccdd${index}`,
-				}),
+				supervisorLine(
+					`2026-09-10T20:0${index}:00.000Z`,
+					`Supervisor command send_message failed: Error: Unknown active session: aabbccdd${index}`,
+				),
 			),
 		);
 		const events = collectIncidentEvents(entries, collectWorkerPidMap(entries));
