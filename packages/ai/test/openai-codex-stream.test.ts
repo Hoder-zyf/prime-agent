@@ -198,12 +198,23 @@ describe("openai-codex streaming", () => {
 		expect(sawDone).toBe(true);
 	});
 
-	it("completes after response.completed even when the SSE body stays open", async () => {
+	it.each([
+		{
+			label: "completes after response.completed",
+			payload: { status: "completed" as const, includeDone: true },
+			stopReason: "stop" as const,
+		},
+		{
+			label: "maps response.incomplete to stopReason length",
+			payload: { status: "incomplete" as const },
+			stopReason: "length" as const,
+		},
+	])("$label even when the SSE body stays open", async ({ payload, stopReason }) => {
 		const tempDir = mkdtempSync(join(tmpdir(), "pi-codex-stream-"));
 		process.env.PI_CODING_AGENT_DIR = tempDir;
 		const token = mockToken();
 		const encoder = new TextEncoder();
-		const sse = buildSSEPayload({ status: "completed", includeDone: true });
+		const sse = buildSSEPayload(payload);
 
 		const stream = new ReadableStream<Uint8Array>({
 			start(controller) {
@@ -246,74 +257,12 @@ describe("openai-codex streaming", () => {
 			messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }],
 		};
 
-		const result = await Promise.race([
-			streamOpenAICodexResponses(model, context, { apiKey: token, transport: "sse" }).result(),
-			new Promise<never>((_, reject) => {
-				setTimeout(() => reject(new Error("Timed out waiting for completed SSE stream")), 1000);
-			}),
-		]);
+		// The SSE body never closes: the terminal event must end the stream on its own, so
+		// the suite timeout is the only bound (no wall-clock race).
+		const result = await streamOpenAICodexResponses(model, context, { apiKey: token, transport: "sse" }).result();
 
 		expect(result.content.find((c) => c.type === "text")?.text).toBe("Hello");
-		expect(result.stopReason).toBe("stop");
-	});
-
-	it("maps response.incomplete to stopReason length even when the SSE body stays open", async () => {
-		const tempDir = mkdtempSync(join(tmpdir(), "pi-codex-stream-"));
-		process.env.PI_CODING_AGENT_DIR = tempDir;
-		const token = mockToken();
-		const encoder = new TextEncoder();
-		const sse = buildSSEPayload({ status: "incomplete" });
-
-		const stream = new ReadableStream<Uint8Array>({
-			start(controller) {
-				controller.enqueue(encoder.encode(sse));
-			},
-		});
-
-		global.fetch = vi.fn(async (input: string | URL) => {
-			const url = typeof input === "string" ? input : input.toString();
-			if (url === "https://api.github.com/repos/openai/codex/releases/latest") {
-				return new Response(JSON.stringify({ tag_name: "rust-v0.0.0" }), { status: 200 });
-			}
-			if (url.startsWith("https://raw.githubusercontent.com/openai/codex/")) {
-				return new Response("PROMPT", { status: 200, headers: { etag: '"etag"' } });
-			}
-			if (url === "https://chatgpt.com/backend-api/codex/responses") {
-				return new Response(stream, {
-					status: 200,
-					headers: { "content-type": "text/event-stream" },
-				});
-			}
-			return new Response("not found", { status: 404 });
-		}) as typeof fetch;
-
-		const model: Model<"openai-codex-responses"> = {
-			id: "gpt-5.1-codex",
-			name: "GPT-5.1 Codex",
-			api: "openai-codex-responses",
-			provider: "openai-codex",
-			baseUrl: "https://chatgpt.com/backend-api",
-			reasoning: true,
-			input: ["text"],
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-			contextWindow: 400000,
-			maxTokens: 128000,
-		};
-
-		const context: Context = {
-			systemPrompt: "You are a helpful assistant.",
-			messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }],
-		};
-
-		const result = await Promise.race([
-			streamOpenAICodexResponses(model, context, { apiKey: token, transport: "sse" }).result(),
-			new Promise<never>((_, reject) => {
-				setTimeout(() => reject(new Error("Timed out waiting for incomplete SSE stream")), 1000);
-			}),
-		]);
-
-		expect(result.content.find((c) => c.type === "text")?.text).toBe("Hello");
-		expect(result.stopReason).toBe("length");
+		expect(result.stopReason).toBe(stopReason);
 	});
 
 	it("sets session_id/x-client-request-id headers and prompt_cache_key when sessionId is provided", async () => {
@@ -1230,9 +1179,11 @@ describe("openai-codex streaming", () => {
 		const sentBodies = installScriptedCodexWebSocket([
 			(socket) => socket.emit(codexResponseEvents({ responseId: "resp_1", messageId: "msg_1", text: "Hello" })),
 			(socket) =>
-				socket.emit(
-					codexErrorEvents("previous_response_not_found", "Previous response with id 'resp_1' not found"),
-				),
+				socket.emit([
+					// Metadata arriving before the stale rejection must not survive as the anchor.
+					{ type: "response.created", response: { id: "resp_stale" } },
+					...codexErrorEvents("previous_response_not_found", "Previous response with id 'resp_1' not found"),
+				]),
 			(socket) =>
 				socket.emit(
 					codexErrorEvents("previous_response_not_found", "Previous response with id 'resp_9' not found"),
@@ -1262,6 +1213,7 @@ describe("openai-codex streaming", () => {
 
 		expect(second.stopReason).toBe("error");
 		expect(second.errorMessage).toBe("Codex error: Previous response with id 'resp_9' not found");
+		expect(second.responseId).toBeUndefined();
 		// Exactly one chain-reset retry, then the error surfaces unchanged.
 		expect(sentBodies).toHaveLength(3);
 		const retryBody = sentBodies[2] as { previous_response_id?: string };
