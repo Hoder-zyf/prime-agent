@@ -2398,6 +2398,12 @@ export class AgentSession {
 				this._goalAbortInProgress = false;
 				return;
 			}
+			// A live quota park owns the resume: the parked turn is the park's
+			// pause, not the goal's death, so the goal survives until the wake
+			// (or a spent park budget, which clears the park first) ends it.
+			if (this._quotaPark !== undefined) {
+				return;
+			}
 			this._finishGoalWithError(message.errorMessage || "Assistant response failed");
 		}
 	}
