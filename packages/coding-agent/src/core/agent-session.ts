@@ -4515,6 +4515,7 @@ export class AgentSession {
 			this._finishActiveRetryWithFailure(msg);
 			this._resolveRetry();
 			if (!compactionWillRetry) {
+				this._handleErroredQuotaParkProbe(msg);
 				this._finishGoalForTerminalAssistantMessage(msg);
 				// In serialized mode, agent-callable refine.run is serviced
 				// at the shouldStopAfterTurn boundary, not here at agent_end.
@@ -13143,11 +13144,28 @@ export class AgentSession {
 	}
 
 	/**
-	 * Wake re-arm for a park whose wake was consumed without resuming (refused
-	 * admission, aborted probe turn). Bounded so a park that can never wake ends
-	 * instead of staying parked with no wake and no way to resume.
+	 * A turn that ended in a plain error after the wake's probe consumed the
+	 * marker is neither a resume nor a re-park: the park would sit `waking` with
+	 * no timer or job left, never resuming. Re-arm the wake (bounded) instead,
+	 * or drop the park once the retries are spent. A marker still queued owns
+	 * the resume, so an error from another turn must not re-arm under it.
 	 */
-	private _recoverQuotaParkWake(outcome: "wake-failed" | "wake-aborted"): void {
+	private _handleErroredQuotaParkProbe(message: AssistantMessage): void {
+		const park = this._quotaPark;
+		if (message.stopReason !== "error" || park?.waking !== true || this._hasQueuedQuotaResumeMarker()) {
+			return;
+		}
+		park.waking = false;
+		this._recoverQuotaParkWake("wake-error");
+	}
+
+	/**
+	 * Wake re-arm for a park whose wake was consumed without resuming (refused
+	 * admission, aborted or errored probe turn). Bounded so a park that can
+	 * never wake ends instead of staying parked with no wake and no way to
+	 * resume.
+	 */
+	private _recoverQuotaParkWake(outcome: "wake-failed" | "wake-aborted" | "wake-error"): void {
 		const park = this._quotaPark;
 		if (!park || park.waking || park.resumeAtMs > Date.now()) {
 			return;
@@ -13163,6 +13181,13 @@ export class AgentSession {
 		park.resumeAtMs = Date.now() + QUOTA_WAKE_RETRY_DELAY_MS;
 		park.jobId = this._createQuotaResumeJob(park.resumeAtMs);
 		park.timer = this._scheduleQuotaResumeTimer(park.resumeAtMs);
+		// Record the replacement wake, or a restart reads the spent park entry,
+		// drops the park, and leaves this retry job armed with no owner to cancel.
+		this.sessionManager.appendCustomEntry(QUOTA_PARK_CUSTOM_ENTRY_TYPE, {
+			resumeAt: new Date(park.resumeAtMs).toISOString(),
+			parkCount: park.parkCount,
+			...(park.jobId !== undefined ? { jobId: park.jobId } : {}),
+		});
 	}
 
 	private _findQuotaResumeJob(jobId: string): AgentCronJob | undefined {
