@@ -939,26 +939,45 @@ export function formatDaemonReconnectBanner(
 	return { message: `Daemon restarted (v${daemonVersion}), this window runs v${clientVersion}.`, tone: "dim" };
 }
 
-/** Numeric version-prefix comparison ("0.9.5-beta.7" orders by 0.9.5); unparseable segments end the comparison. */
+/**
+ * Numeric version-prefix comparison ("0.9.5-beta.7" orders by 0.9.5); unparseable segments
+ * end the comparison. A numeric-equal release outranks the same version's prereleases.
+ */
 function isDaemonVersionNewer(daemonVersion: string, clientVersion: string): boolean {
-	const parse = (value: string): number[] => {
-		const segments: number[] = [];
-		for (const segment of value.split(/[.-]/)) {
-			const parsed = Number(segment);
-			if (!Number.isFinite(parsed)) break;
-			segments.push(parsed);
-		}
-		return segments;
-	};
-	const daemon = parse(daemonVersion);
-	const client = parse(clientVersion);
+	const daemon = parseNumericVersionPrefix(daemonVersion);
+	const client = parseNumericVersionPrefix(clientVersion);
 	for (let index = 0; index < Math.max(daemon.length, client.length); index++) {
 		const difference = (daemon[index] ?? 0) - (client[index] ?? 0);
 		if (difference !== 0) {
 			return difference > 0;
 		}
 	}
-	return false;
+	// Semver orders a release ahead of its own prereleases ("1.2.3" > "1.2.3-beta.1"),
+	// so a numeric-equal daemon without a prerelease suffix outranks a client with one.
+	return !hasPrereleaseSuffix(daemonVersion) && hasPrereleaseSuffix(clientVersion);
+}
+
+/** The dot- and dash-separated segments of a version: "1.2.3-beta.1" -> ["1", "2", "3", "beta", "1"]. */
+function splitVersionSegments(value: string): string[] {
+	return value.split(/[.-]/);
+}
+
+/** The leading numeric segments of a version string; the first unparseable segment ends the prefix. */
+function parseNumericVersionPrefix(value: string): number[] {
+	const segments: number[] = [];
+	for (const segment of splitVersionSegments(value)) {
+		const parsed = Number(segment);
+		if (!Number.isFinite(parsed)) break;
+		segments.push(parsed);
+	}
+	return segments;
+}
+
+/** Whether a version string continues past its numeric prefix with a prerelease suffix. */
+function hasPrereleaseSuffix(version: string): boolean {
+	const segments = splitVersionSegments(version);
+	const prefixLength = parseNumericVersionPrefix(version).length;
+	return prefixLength > 0 && prefixLength < segments.length;
 }
 
 export function updateArgsIncludeSelf(args: readonly string[]): boolean {

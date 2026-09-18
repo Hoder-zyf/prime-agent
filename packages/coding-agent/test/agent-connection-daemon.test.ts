@@ -1523,6 +1523,28 @@ describe("DaemonAgentConnection", () => {
 		}
 	});
 
+	it("a shutdown recovery does not duplicate an update recovery's resync", async () => {
+		vi.useFakeTimers();
+		try {
+			const fakeClient = new FakeDaemonClient();
+			const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-original");
+			const events: AgentConnectionEvent[] = [];
+			connection.subscribe((event) => void events.push(event));
+			await connection.attach();
+			fakeClient.emitClose(new DaemonSocketClosedError("/tmp/prime-agent.sock", "shutdown"));
+			await vi.advanceTimersByTimeAsync(50); // parks the shutdown recovery on its retry delay
+			fakeClient.updateRestartSessions = [{ id: "r1", activeSessionId: "restored", sessionId: "session-current" }];
+			fakeClient.emitMessage({ type: "session_closed", activeSessionId: "active-original", reason: "update" });
+			await vi.advanceTimersByTimeAsync(150); // the update recovery restores before the shutdown loop wakes
+			const connected = events.filter((event) => event.type === "connection_status" && event.status === "connected");
+			expect(events.filter((event) => event.type === "session_resynced")).toHaveLength(1);
+			expect(connected).toHaveLength(1);
+			await connection.dispose();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it("keeps the saved-transcript close after shutdown recovery times out", async () => {
 		vi.useFakeTimers();
 		try {

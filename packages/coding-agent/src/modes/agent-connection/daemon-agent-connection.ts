@@ -2189,13 +2189,14 @@ export class DaemonAgentConnection implements AgentConnection {
 		const reconnectPromise = reconnectDaemonTransportAfterUpdate(this.client)
 			.then(() => this.restoreConnectionAfterUpdate())
 			.then(() => {
-				if (!this.disposed && !this.terminalCloseEmitted) {
-					void this.emit({
-						type: "connection_status",
-						status: "connected",
-						daemonVersion: this.client.hello?.appVersion,
-					});
+				if (this.disposed || this.terminalCloseEmitted) {
+					return;
 				}
+				void this.emit({
+					type: "connection_status",
+					status: "connected",
+					daemonVersion: this.client.hello?.appVersion,
+				});
 			})
 			.catch(async (error: unknown) => {
 				this.updateRestartPending = false;
@@ -2244,15 +2245,17 @@ export class DaemonAgentConnection implements AgentConnection {
 					retryMs: SHUTDOWN_RECONNECT_RETRY_MS,
 				}),
 			)
-			.then(() => {
-				// An update-restart recovery that took over owns the connected banner.
-				if (!this.disposed && !this.terminalCloseEmitted && !this.updateRestartPending) {
-					void this.emit({
-						type: "connection_status",
-						status: "connected",
-						daemonVersion: this.client.hello?.appVersion,
-					});
+			.then((restored) => {
+				// An update-restart recovery that took over owns the connected banner, even
+				// once its flag cleared: only a restore this loop performed reports one here.
+				if (!restored || this.disposed || this.terminalCloseEmitted || this.updateRestartPending) {
+					return;
 				}
+				void this.emit({
+					type: "connection_status",
+					status: "connected",
+					daemonVersion: this.client.hello?.appVersion,
+				});
 			})
 			.catch(async (_error: unknown) => {
 				this.shutdownReconnectFailed = true;
@@ -2270,7 +2273,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		return reconnectPromise;
 	}
 
-	private async restoreConnectionAfterUpdate(): Promise<void> {
+	private async restoreConnectionAfterUpdate(): Promise<boolean> {
 		return this.restoreConnectionAfterDaemonRestart({
 			timeoutMs: UPDATE_RECONNECT_TIMEOUT_MS,
 			retryMs: UPDATE_RECONNECT_RETRY_MS,
@@ -2278,24 +2281,35 @@ export class DaemonAgentConnection implements AgentConnection {
 		});
 	}
 
-	private async restoreConnectionAfterDaemonRestart(options: DaemonRestartRestoreOptions): Promise<void> {
+	private async restoreConnectionAfterDaemonRestart(options: DaemonRestartRestoreOptions): Promise<boolean> {
 		const sessionId = this.attachedSessionId;
 		const sessionFile = this.attachedSessionFile;
 		if (!sessionId && !sessionFile) {
 			throw new Error("the previous session identity is unavailable");
 		}
+		// An update-restart recovery outranks a generic shutdown recovery even after it
+		// finished: it clears updateRestartPending as soon as it restores, but the
+		// sessionRevision bump it leaves behind stands. ownRevisionBumps counts this
+		// loop's own bumps, so a revision bumped by anyone else is the permanent signal
+		// that the update recovery restored the session and this loop yields.
+		const startSessionRevision = this.sessionRevision;
+		let ownRevisionBumps = 0;
 		const deadline = Date.now() + options.timeoutMs;
 		let lastError: unknown;
 		while (!this.disposed && !this.terminalCloseEmitted && Date.now() < deadline) {
-			// An update-restart recovery outranks a plain-shutdown recovery still polling.
-			if (!options.updateRestart && this.updateRestartPending) {
-				return;
+			// An update-restart recovery outranks a plain-shutdown recovery still polling:
+			// while it runs (its flag) and once it restored (its revision bump).
+			if (
+				!options.updateRestart &&
+				(this.updateRestartPending || this.sessionRevision !== startSessionRevision + ownRevisionBumps)
+			) {
+				return false;
 			}
 			try {
 				// Every attempt waits no longer than the bound: the terminal close must not slip past it.
 				await this.client.reconnect(Math.max(1, Math.min(1000, deadline - Date.now())));
 				if (this.disposed || this.terminalCloseEmitted) {
-					return;
+					return false;
 				}
 				// This loop owns the retry: a socket close must reject these instead of parking them behind a hello it can never produce.
 				// The list waits no longer than the bound: the terminal close must not slip past it.
@@ -2305,7 +2319,7 @@ export class DaemonAgentConnection implements AgentConnection {
 					{ recoverable: false },
 				);
 				if (this.disposed || this.terminalCloseEmitted) {
-					return;
+					return false;
 				}
 				if (!response.success) {
 					throw deserializeDaemonError(response);
@@ -2319,38 +2333,44 @@ export class DaemonAgentConnection implements AgentConnection {
 				);
 				if (restored?.activeSessionId) {
 					if (this.disposed || this.terminalCloseEmitted) {
-						return;
+						return false;
 					}
 					this.sessionRevision++;
+					ownRevisionBumps++;
 					this.activeSessionId = restored.activeSessionId;
 					this.lastEventSequence = undefined;
 					this.lastEventCursor = undefined;
 					this.retiredEventGenerations.clear();
 					await this.attach({ recoverable: false });
 					if (this.disposed || this.terminalCloseEmitted) {
-						return;
+						return false;
 					}
 					const snapshot = await this.getInitialSnapshot({ recoverable: false });
 					if (this.disposed || this.terminalCloseEmitted) {
-						return;
+						return false;
 					}
 					// An update-restart recovery that took over while this iteration was in
-					// flight owns the resync: this iteration must not emit a duplicate.
-					if (!options.updateRestart && this.updateRestartPending) {
-						return;
+					// flight owns the resync: this iteration must not emit a duplicate. It
+					// clears its flag once it restores, so the revision bump it left behind
+					// is the permanent marker this generic recovery yields to.
+					if (
+						!options.updateRestart &&
+						(this.updateRestartPending || this.sessionRevision !== startSessionRevision + ownRevisionBumps)
+					) {
+						return false;
 					}
 					if (options.updateRestart) this.updateRestartPending = false;
 					void this.emit({ type: "session_resynced", snapshot });
-					return;
+					return true;
 				}
 			} catch (error) {
 				lastError = error;
 			}
-			if (this.disposed || this.terminalCloseEmitted) return;
+			if (this.disposed || this.terminalCloseEmitted) return false;
 			await delay(options.retryMs);
 		}
 		if (this.disposed || this.terminalCloseEmitted) {
-			return;
+			return false;
 		}
 		throw lastError ?? new Error("the restored session did not become available");
 	}
