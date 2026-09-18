@@ -4808,8 +4808,7 @@ export class InteractiveMode {
 			this.editor.insertTextAtCursor?.(formatImageMarker(markerId));
 			this.ui.requestRender();
 
-			const model = this.getCurrentModel();
-			if (model && !model.input.includes("image")) {
+			if (!this.imageAttachmentsPossible()) {
 				this.showStatus("Current model does not support images; the attachment will be omitted.");
 			}
 		} catch {
@@ -4865,15 +4864,28 @@ export class InteractiveMode {
 	 *
 	 * Resolved against the current model: if it has no image input, attachments
 	 * are dropped here (matching the paste-time hint) rather than sent and
-	 * downgraded downstream.
+	 * downgraded downstream — unless settings.imageModel routes image turns to
+	 * an image-capable model, in which case the attachment reaches the session
+	 * and the dispatch-time routing or refusal decides what happens.
 	 */
 	private collectImagesFor(text: string): ImageContent[] | undefined {
-		const model = this.getCurrentModel();
-		if (model && !model.input.includes("image")) {
+		if (!this.imageAttachmentsPossible()) {
 			return undefined;
 		}
 		const images = collectMarkedImages(this.pastedImages, text);
 		return images.length > 0 ? images : undefined;
+	}
+
+	/**
+	 * Whether image attachments can reach a model at all: the current model
+	 * takes image input, or settings.imageModel routes image turns to one that
+	 * does. An unusable imageModel still fails the routed turn at dispatch with
+	 * an actionable error, which is more honest than dropping the paste.
+	 */
+	private imageAttachmentsPossible(): boolean {
+		const model = this.getCurrentModel();
+		if (!model || model.input.includes("image")) return true;
+		return this.settingsManager.getImageModel() !== undefined;
 	}
 
 	private hasPastedImagesFor(text: string): boolean {

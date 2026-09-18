@@ -18,6 +18,7 @@ const IMAGE: ImageContent = { type: "image", mimeType: "image/png", data: "aGk="
 const SET = { imageModel: "claude-haiku-4-5" };
 const SET_BLOCKED = { imageModel: "claude-haiku-4-5", images: { blockImages: true } };
 const SET_UNUSABLE = { imageModel: "openai/gpt-5.4" };
+const SET_TEXTONLY = { imageModel: "deepseek/deepseek-v4-pro" };
 
 // [name, settings, vision session model, attaches images, served model id, rejection]
 it.each([
@@ -27,6 +28,7 @@ it.each([
 	["session model serves blocked-image turns", SET_BLOCKED, false, true, "claude-opus-4-7-text-only", undefined],
 	["refuses image turns without imageModel", {}, false, true, undefined, /does not accept image input/],
 	["refuses an unusable imageModel", SET_UNUSABLE, false, true, undefined, /could not be resolved/],
+	["refuses a text-only imageModel", SET_TEXTONLY, false, true, undefined, /could not be resolved/],
 ])("%s", async (_name, settings, vision, images, served, reject) => {
 	const dir = mkdtempSync(join(tmpdir(), "pi-image-model-"));
 	writeFileSync(join(dir, "settings.json"), JSON.stringify(settings));
@@ -48,6 +50,7 @@ it.each([
 	});
 	const auth = AuthStorage.create(join(dir, "auth.json"));
 	auth.setRuntimeApiKey("anthropic", "test-key");
+	auth.setRuntimeApiKey("deepseek", "test-key");
 	const session = new AgentSession({
 		agent,
 		sessionManager: SessionManager.inMemory(),
