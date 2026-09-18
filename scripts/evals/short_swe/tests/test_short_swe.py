@@ -185,12 +185,19 @@ def test_patch_collection_overrides_candidate_diff_prefix_config(tmp_path: Path)
     subprocess.run(["git", "config", "diff.srcPrefix", "i/"], cwd=repo, check=True)
     subprocess.run(["git", "config", "diff.dstPrefix", "j/"], cwd=repo, check=True)
     subprocess.run(["git", "config", "diff.mnemonicPrefix", "true"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "diff.noprefix", "true"], cwd=repo, check=True)
 
     task = tmp_path / "task/tests"
     task.mkdir(parents=True)
     (task / "config.json").write_text(json.dumps({"base_commit": base}))
     command = verified_verifier.patch_collect_command(task.parent)
-    assert "-c diff.srcPrefix=a/ -c diff.dstPrefix=b/ -c diff.mnemonicPrefix=false" in command
+    pins = [
+        "-c diff.srcPrefix=a/",
+        "-c diff.dstPrefix=b/",
+        "-c diff.mnemonicPrefix=false",
+        "-c diff.noprefix=false",
+    ]
+    assert all(pin in command for pin in pins)
     subprocess.run(command.split(" && ", 1)[1], cwd=repo, check=True, shell=True)
     patch = Path("/tmp/prime-agent.patch").read_text()
     assert "diff --git a/tests/test_x.py b/tests/test_x.py" in patch
@@ -863,6 +870,7 @@ class TestFilterTestControl:
             "diff --git i/tests/conftest.py j/tests/conftest.py\n",
             "diff --git a/tests/conftest.py j/tests/conftest.py\n",
             "diff --git i/tests/conftest.py b/tests/conftest.py\n",
+            "diff --git tests/conftest.py tests/conftest.py\n",
         ):
             patch = header + (
                 "index 1234567..89abcde 100644\n"

@@ -29,13 +29,15 @@ def patch_collect_command(task_dir: Path) -> str:
     base = trusted_base_commit(task_dir)
     # The candidate agent controls this sandbox, including its git config, so the
     # collect command must not honor repo-local diff prefix settings: a candidate
-    # that sets diff.srcPrefix/diff.dstPrefix (or diff.mnemonicPrefix) would emit
-    # headers like "diff --git i/tests/conftest.py j/tests/conftest.py", which
-    # _patch_paths cannot attribute to a path. -c overrides any repo config.
+    # that sets diff.srcPrefix/diff.dstPrefix (or diff.mnemonicPrefix, or
+    # diff.noprefix) would emit headers like "diff --git i/tests/conftest.py
+    # j/tests/conftest.py" or prefix-less ones, which _patch_paths cannot attribute
+    # to a path. -c overrides any repo config.
     return (
         "rm -rf /logs/artifacts && "
         "git add -N -- . && "
         "git -c diff.srcPrefix=a/ -c diff.dstPrefix=b/ -c diff.mnemonicPrefix=false "
+        "-c diff.noprefix=false "
         f"diff --binary --no-ext-diff {base} -- . > /tmp/prime-agent.patch"
     )
 
