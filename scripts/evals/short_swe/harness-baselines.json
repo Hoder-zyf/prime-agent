@@ -49,7 +49,7 @@
           "uncached_input_tokens": 485600,
           "cached_input_tokens": 5500000,
           "output_tokens": 40700,
-          "measured": false
+          "measured": true
         },
         "swebench-pro": {
           "resolved": 7,
@@ -57,7 +57,7 @@
           "uncached_input_tokens": 533600,
           "cached_input_tokens": 8610000,
           "output_tokens": 47700,
-          "measured": false
+          "measured": true
         },
         "scaleswe": {
           "resolved": 3,
@@ -65,7 +65,7 @@
           "uncached_input_tokens": 194000,
           "cached_input_tokens": 3570000,
           "output_tokens": 29700,
-          "measured": false
+          "measured": true
         }
       },
       "model_failures": 0,
@@ -119,7 +119,7 @@
           "uncached_input_tokens": 0,
           "cached_input_tokens": 0,
           "output_tokens": 0,
-          "measured": false
+          "measured": true
         },
         "swebench-pro": {
           "resolved": 1,
@@ -127,7 +127,7 @@
           "uncached_input_tokens": 0,
           "cached_input_tokens": 0,
           "output_tokens": 0,
-          "measured": false
+          "measured": true
         },
         "scaleswe": {
           "resolved": 2,
@@ -135,7 +135,7 @@
           "uncached_input_tokens": 0,
           "cached_input_tokens": 0,
           "output_tokens": 0,
-          "measured": false
+          "measured": true
         }
       },
       "model_failures": 0,
