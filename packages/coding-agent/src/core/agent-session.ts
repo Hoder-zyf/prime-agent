@@ -9,6 +9,7 @@ import {
 	AgentContinueError,
 	type AgentEvent,
 	type AgentMessage,
+	type AgentModelOverride,
 	type AgentState,
 	type AgentTool,
 	type GetContinuationMessagesContext,
@@ -171,6 +172,7 @@ import {
 	validateGoalBudget,
 	validateGoalObjective,
 } from "./goals.js";
+import { resolveImageModelOverride } from "./image-model-routing.js";
 import type { HostRequestHandlers, KernelSentAgentMessage } from "./kernel/index.js";
 import { type RestoreResult, snapshotPathIn } from "./kernel/state-snapshot.js";
 import type { AcpMcpServerConfig } from "./mcp/acp-mcp-types.js";
@@ -839,6 +841,14 @@ function normalizeMessageContent(content: string | (TextContent | ImageContent)[
 		.join("\n");
 	const images = content.filter((part): part is ImageContent => part.type === "image");
 	return { text, ...(images.length > 0 ? { images } : {}) };
+}
+
+/**
+ * Whether a delivered message attaches image content. Used to route
+ * image-carrying turns off session models without image input.
+ */
+function messageCarriesImages(message: QueuedAgentMessage): boolean {
+	return Array.isArray(message.content) && message.content.some((part) => part.type === "image");
 }
 
 function queuedAgentMessagePreview(action: QueuedSessionAction): string {
@@ -2511,6 +2521,34 @@ export class AgentSession {
 			}
 			throw new Error(formatNoApiKeyFoundMessage(this.model.provider));
 		}
+	}
+
+	/**
+	 * Routing decision for a dispatched turn batch: when any delivered message
+	 * attaches images and the session model has no image input, serve the turn
+	 * on the user-configured imageModel (settings.imageModel) instead.
+	 *
+	 * The override is stored on the agent, so retries and post-compaction
+	 * continuations of the routed turn keep serving it; the next dispatch
+	 * re-evaluates it, so later image-free turns return to the session model.
+	 * A missing session model is reported by _validateCanStartAgentRun.
+	 */
+	private _imageModelOverrideForTurns(turns: SessionAction<PreparedTurnPayload>[]): AgentModelOverride | undefined {
+		const sessionModel = this.model;
+		if (!sessionModel) return undefined;
+		const carriesImages = turns.some((action) =>
+			action.payload.records.some((record) => messageCarriesImages(record.message)),
+		);
+		if (!carriesImages) return undefined;
+		return resolveImageModelOverride({
+			sessionModel,
+			thinkingLevel: this.thinkingLevel,
+			serviceTier: this.serviceTier,
+			imageModelReference: this.settingsManager.getImageModel(),
+			availableModels: this._modelRegistry.getAvailable(),
+			hasConfiguredAuth: (model) => this._modelRegistry.hasConfiguredAuth(model),
+			blockImages: this.settingsManager.getBlockImages(),
+		});
 	}
 
 	/**
@@ -6920,6 +6958,10 @@ export class AgentSession {
 					const preparedMessages: AgentMessage[] = turns.flatMap((action) =>
 						action.payload.records.map((record) => record.message),
 					);
+					// Re-evaluate image routing for this turn batch. Retries and post-compaction
+					// continuations of a routed turn re-read the override, so they keep serving
+					// it; the next dispatch overwrites it with the fresh decision.
+					this.agent.modelOverride = this._imageModelOverrideForTurns(turns);
 					for (const action of turns) {
 						if (action.suppressAutonomousContinuation) {
 							this._markAutonomousContinuationSuppressed(primaryDeliveryRecord(action).message);
