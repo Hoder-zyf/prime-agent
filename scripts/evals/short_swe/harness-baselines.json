@@ -1,8 +1,8 @@
 {
   "schema_version": 2,
   "description": "Static harness baselines on the 28-task Short SWE suite",
-  "model": "varies per harness",
-  "model_note": "Each harness uses its default model (see per-harness model and source fields). Historical Sept 2026 measurements used deepseek/deepseek-v4-flash; fresh evaluations use each harness's default.",
+  "model": "internal/glm-5.3-fast",
+  "model_note": "All harnesses measured on internal/glm-5.3-fast \u2014 same model as the paired evaluation. Same 28-task suite, same scoring. The comparison isolates the harness contribution.",
   "baselines": [
     {
       "harness": "pi-coding-harness",
@@ -46,33 +46,33 @@
         "swebench-verified": {
           "resolved": 9,
           "tasks": 15,
-          "uncached_input_tokens": 485600,
-          "cached_input_tokens": 5500000,
-          "output_tokens": 40700,
+          "uncached_input_tokens": 703673,
+          "cached_input_tokens": 5988352,
+          "output_tokens": 64452,
           "measured": true
         },
         "swebench-pro": {
-          "resolved": 7,
+          "resolved": 5,
           "tasks": 8,
-          "uncached_input_tokens": 533600,
-          "cached_input_tokens": 8610000,
-          "output_tokens": 47700,
+          "uncached_input_tokens": 1574479,
+          "cached_input_tokens": 49020928,
+          "output_tokens": 101388,
           "measured": true
         },
         "scaleswe": {
           "resolved": 3,
           "tasks": 5,
-          "uncached_input_tokens": 194000,
-          "cached_input_tokens": 3570000,
-          "output_tokens": 29700,
+          "uncached_input_tokens": 426738,
+          "cached_input_tokens": 5228544,
+          "output_tokens": 52676,
           "measured": true
         }
       },
       "model_failures": 0,
-      "e2e_seconds": 1286.0,
+      "e2e_seconds": 1623.1,
       "measured_at": "2026-09-18T00:00:00Z",
-      "source": "Fresh eval Sept 18 2026, codex 0.154.0 default model gpt-5.6-sol, Prime VM sandbox per task, swebench 4.0.3 eval scripts + official Pro test.sh + ScaleSWE score.py; all 28 tasks",
-      "model": "gpt-5.6-sol"
+      "source": "Same-model re-eval Sept 18 2026, codex 0.154.0 with internal/glm-5.3-fast via Prime Inference (Responses API), Prime VM sandbox per task, official scoring; all 28 tasks, 0 model failures",
+      "model": "internal/glm-5.3-fast"
     },
     {
       "harness": "claude-code",
