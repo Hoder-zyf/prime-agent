@@ -116,25 +116,25 @@
         "swebench-verified": {
           "resolved": 10,
           "tasks": 15,
-          "uncached_input_tokens": 0,
-          "cached_input_tokens": 0,
-          "output_tokens": 0,
+          "uncached_input_tokens": 4067040,
+          "cached_input_tokens": 10183552,
+          "output_tokens": 406209,
           "measured": true
         },
         "swebench-pro": {
           "resolved": 1,
           "tasks": 8,
-          "uncached_input_tokens": 0,
-          "cached_input_tokens": 0,
-          "output_tokens": 0,
+          "uncached_input_tokens": 5457547,
+          "cached_input_tokens": 14349632,
+          "output_tokens": 421654,
           "measured": true
         },
         "scaleswe": {
           "resolved": 2,
           "tasks": 5,
-          "uncached_input_tokens": 0,
-          "cached_input_tokens": 0,
-          "output_tokens": 0,
+          "uncached_input_tokens": 3448785,
+          "cached_input_tokens": 12754432,
+          "output_tokens": 165767,
           "measured": true
         }
       },
@@ -151,25 +151,25 @@
         "swebench-verified": {
           "resolved": 6,
           "tasks": 15,
-          "uncached_input_tokens": 1660000,
-          "cached_input_tokens": 15640000,
-          "output_tokens": 1100000,
+          "uncached_input_tokens": 1497428,
+          "cached_input_tokens": 13005824,
+          "output_tokens": 1095094,
           "measured": true
         },
         "swebench-pro": {
           "resolved": 3,
           "tasks": 8,
-          "uncached_input_tokens": 887000,
-          "cached_input_tokens": 8350000,
-          "output_tokens": 586000,
+          "uncached_input_tokens": 972615,
+          "cached_input_tokens": 10501120,
+          "output_tokens": 607403,
           "measured": true
         },
         "scaleswe": {
           "resolved": 3,
           "tasks": 5,
-          "uncached_input_tokens": 553000,
-          "cached_input_tokens": 5210000,
-          "output_tokens": 364000,
+          "uncached_input_tokens": 667659,
+          "cached_input_tokens": 5729280,
+          "output_tokens": 346989,
           "measured": true
         }
       },
