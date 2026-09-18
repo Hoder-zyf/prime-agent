@@ -32,6 +32,7 @@ import {
 	collectDaemonClientEnv,
 	collectDaemonLaunchEnv,
 	type DaemonAttachResult,
+	type DaemonClosingReason,
 	type DaemonCommand,
 	type DaemonEventCursor,
 	type DaemonOutbound,
@@ -289,6 +290,8 @@ export class DaemonAgentConnection implements AgentConnection {
 	private updateReconnectPromise?: Promise<void>;
 	private shutdownReconnectFailed = false;
 	private shutdownReconnectPromise?: Promise<void>;
+	/** Reason the daemon last announced itself closing; cleared once the connection is (re)established. */
+	private daemonClosingNotice?: DaemonClosingReason;
 	private readonly activeSideQuestionIds = new Set<string>();
 	private readonly snapshotAssemblies = new Map<string, DaemonSnapshotAssembly>();
 	private readonly completedSnapshots = new Map<string, DaemonSessionSnapshot>();
@@ -529,6 +532,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		this.updateReconnectFailed = false;
 		this.shutdownReconnectFailed = false;
 		this.terminalCloseEmitted = false;
+		this.daemonClosingNotice = undefined;
 		// The roster bar is an accessory: its subscribe failure must never fail an
 		// otherwise-recovered session. The bar degrades; the next reconnect or rebind
 		// re-attaches through this same seam.
@@ -1957,6 +1961,12 @@ export class DaemonAgentConnection implements AgentConnection {
 			await this.emit({ type: "heartbeats_changed" });
 			return;
 		}
+		if (message.type === "daemon_closing") {
+			// An orderly daemon shutdown announces itself before it closes sessions: the
+			// notice distinguishes that shutdown from a bare session stop below.
+			this.daemonClosingNotice = message.reason;
+			return;
+		}
 		if (!this.isMessageForActiveSession(message)) {
 			return;
 		}
@@ -2124,6 +2134,13 @@ export class DaemonAgentConnection implements AgentConnection {
 				this.captureDaemonLogPath();
 				this.updateRestartPending = true;
 				void this.reconnectAfterUpdate();
+				return;
+			}
+			if (message.reason === "shutdown" && this.daemonClosingNotice === "shutdown") {
+				// The daemon itself is going away (daemon_closing announced it): recover the
+				// window when it comes back. A bare session stop has no notice and stays stopped.
+				this.captureDaemonLogPath();
+				void this.reconnectAfterShutdown();
 				return;
 			}
 			this.terminalCloseEmitted = true;

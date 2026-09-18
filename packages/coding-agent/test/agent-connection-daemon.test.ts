@@ -1442,22 +1442,16 @@ describe("DaemonAgentConnection", () => {
 		expect(fakeClient.reconnectCount).toBe(1);
 	});
 
-	it("does not reconnect after an explicit shutdown session close", async () => {
+	it("does not reconnect after a shutdown session stop that never announced the daemon closing", async () => {
 		const fakeClient = new FakeDaemonClient();
 		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-original");
 		const closedEvents: AgentConnectionEvent[] = [];
 		connection.subscribe((event) => {
-			if (event.type === "closed") {
-				closedEvents.push(event);
-			}
+			if (event.type === "closed") closedEvents.push(event);
 		});
 		await connection.attach();
-
-		fakeClient.emitMessage({
-			type: "session_closed",
-			activeSessionId: "active-original",
-			reason: "shutdown",
-		});
+		// No daemon_closing notice: an explicit session stop stays stopped.
+		fakeClient.emitMessage({ type: "session_closed", activeSessionId: "active-original", reason: "shutdown" });
 		fakeClient.emitClose(new Error("Daemon socket closed"));
 		await Promise.resolve();
 
@@ -1473,7 +1467,20 @@ describe("DaemonAgentConnection", () => {
 		expect(closedError).toContain("Diagnostic log:");
 	});
 
-	it("recovers a shutdown close by reconnecting to the restarted daemon", async () => {
+	it.each([
+		[
+			"shutdown socket close",
+			(fakeClient: FakeDaemonClient) =>
+				fakeClient.emitClose(new DaemonSocketClosedError("/tmp/prime-agent.sock", "shutdown")),
+		],
+		[
+			"announced orderly daemon shutdown",
+			(fakeClient: FakeDaemonClient) => {
+				fakeClient.emitMessage({ type: "daemon_closing", reason: "shutdown" });
+				fakeClient.emitMessage({ type: "session_closed", activeSessionId: "active-original", reason: "shutdown" });
+			},
+		],
+	])("recovers a %s by reconnecting to the restarted daemon", async (_closeKind, triggerClose) => {
 		const fakeClient = new FakeDaemonClient();
 		fakeClient.hello = { ...fakeClient.hello!, appVersion: "test-daemon-version" };
 		// The restarted daemon lists the same session under a new active id.
@@ -1488,7 +1495,7 @@ describe("DaemonAgentConnection", () => {
 		});
 		await connection.attach();
 
-		fakeClient.emitClose(new DaemonSocketClosedError("/tmp/prime-agent.sock", "shutdown"));
+		triggerClose(fakeClient);
 
 		await expect(connected).resolves.toMatchObject({ daemonVersion: "test-daemon-version" });
 		expect(events.filter((event) => event.type === "closed")).toEqual([]);
