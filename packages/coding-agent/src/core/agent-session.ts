@@ -8154,6 +8154,9 @@ export class AgentSession {
 		const serviceTier = this._getServiceTierForModelSwitch();
 
 		this.agent.state.model = next.model;
+		// An explicit selection wins over any image-model routing still lingering
+		// from the last dispatched turn.
+		this.agent.modelOverride = undefined;
 		this.sessionManager.appendModelChange(next.model.provider, next.model.id);
 		this.settingsManager.setDefaultModelAndProvider(next.model.provider, next.model.id);
 
@@ -8193,6 +8196,9 @@ export class AgentSession {
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
 		const serviceTier = this._getServiceTierForModelSwitch();
 		this.agent.state.model = nextModel;
+		// An explicit selection wins over any image-model routing still lingering
+		// from the last dispatched turn.
+		this.agent.modelOverride = undefined;
 		this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
 		this.settingsManager.setDefaultModelAndProvider(nextModel.provider, nextModel.id);
 

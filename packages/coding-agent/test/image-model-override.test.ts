@@ -29,7 +29,8 @@ it.each([
 	["refuses image turns without imageModel", {}, false, true, undefined, /does not accept image input/],
 	["refuses an unusable imageModel", SET_UNUSABLE, false, true, undefined, /could not be resolved/],
 	["refuses a text-only imageModel", SET_TEXTONLY, false, true, undefined, /could not be resolved/],
-])("%s", async (_name, settings, vision, images, served, reject) => {
+	["cycling clears the routed override", SET, false, true, "claude-haiku-4-5", undefined, true],
+])("%s", async (_name, settings, vision, images, served, reject, cycleAfter?: boolean) => {
 	const dir = mkdtempSync(join(tmpdir(), "pi-image-model-"));
 	writeFileSync(join(dir, "settings.json"), JSON.stringify(settings));
 	const base = getModel("anthropic", "claude-opus-4-7")!;
@@ -65,6 +66,13 @@ it.each([
 		await prompt;
 		expect(servedIds).toEqual([served]);
 		expect(session.model?.id).toBe(sessionModel.id);
+		if (!cycleAfter) return;
+		// The routed turn leaves its override behind; cycling must clear it so
+		// the selection wins over later continues, retries, and compaction.
+		expect(session.agent.modelOverride?.model.id).toBe(served);
+		await session.cycleModel("forward", { waitForExtensions: false });
+		expect(session.agent.modelOverride).toBeUndefined();
+		expect(session.model?.id).not.toBe(sessionModel.id);
 	} finally {
 		session.dispose();
 		rmSync(dir, { recursive: true, force: true });
