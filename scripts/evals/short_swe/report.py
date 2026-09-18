@@ -254,6 +254,26 @@ def render_baselines(measured: dict[str, dict]) -> list[str]:
         plural = "s" if len(unmeasured) > 1 else ""
         lines.append(f"Baseline{plural} not yet measured: {', '.join(unmeasured)}.")
     lines.append("Static reference only; harness baselines never gate the PR.")
+    lines.extend(
+        [
+            "",
+            "| Harness | Uncached input | Cached input | Output |",
+            "| --- | ---: | ---: | ---: |",
+        ]
+    )
+    for harness, label in HARNESS_LABELS.items():
+        entry = measured.get(harness)
+        if entry is None or not entry.get("tasksets"):
+            lines.append(f"| {label} | ? | ? | ? |")
+        else:
+            tasksets = entry["tasksets"]
+            uncached = sum(ts.get("uncached_input_tokens", 0) for ts in tasksets.values())
+            cached = sum(ts.get("cached_input_tokens", 0) for ts in tasksets.values())
+            output = sum(ts.get("output_tokens", 0) for ts in tasksets.values())
+            if any(ts.get("measured") for ts in tasksets.values()):
+                lines.append(f"| {label} | {uncached:,} | {cached:,} | {output:,} |")
+            else:
+                lines.append(f"| {label} | ? | ? | ? |")
     return lines
 
 
