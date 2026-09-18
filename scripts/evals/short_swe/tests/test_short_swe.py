@@ -156,6 +156,50 @@ def test_patch_collection_uses_trusted_base_and_keeps_all_git_states(tmp_path: P
     assert (clone / "untracked.txt").read_text() == "untracked\n"
 
 
+def test_patch_collection_overrides_candidate_diff_prefix_config(tmp_path: Path) -> None:
+    """A candidate that rewrites its repo's diff prefix config must not escape the filter.
+
+    git config diff.srcPrefix/diff.dstPrefix (or diff.mnemonicPrefix) in the solver
+    sandbox would make plain git diff emit headers like "diff --git i/... j/...",
+    whose sections filter_test_control cannot attribute to a path. The collect
+    command must pin the a/ and b/ prefixes itself.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=repo, check=True)
+    (repo / "src.py").write_text("x = 1\n")
+    tests = repo / "tests"
+    tests.mkdir()
+    (tests / "test_x.py").write_text("def test_x():\n    assert 1 == 1\n")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=repo, check=True)
+    base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+
+    # Candidate tampers with the test and rewrites the diff prefixes it will be
+    # collected with.
+    (tests / "test_x.py").write_text("def test_x():\n    assert 1 == 2\n")
+    (repo / "src.py").write_text("x = 2\n")
+    subprocess.run(["git", "config", "diff.srcPrefix", "i/"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "diff.dstPrefix", "j/"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "diff.mnemonicPrefix", "true"], cwd=repo, check=True)
+
+    task = tmp_path / "task/tests"
+    task.mkdir(parents=True)
+    (task / "config.json").write_text(json.dumps({"base_commit": base}))
+    command = verified_verifier.patch_collect_command(task.parent)
+    assert "-c diff.srcPrefix=a/ -c diff.dstPrefix=b/ -c diff.mnemonicPrefix=false" in command
+    subprocess.run(command.split(" && ", 1)[1], cwd=repo, check=True, shell=True)
+    patch = Path("/tmp/prime-agent.patch").read_text()
+    assert "diff --git a/tests/test_x.py b/tests/test_x.py" in patch
+
+    filtered = verified_verifier.filter_test_control(patch)
+    assert "x = 2" in filtered
+    assert "assert 1 == 2" not in filtered
+
+
 def test_verified_test_rewrite_handles_pinned_install_variants() -> None:
     for install in [*sorted(verified_verifier.INSTALLS), None]:
         script = "\n".join(
@@ -805,6 +849,30 @@ class TestFilterTestControl:
             filter_test_control("--- a/x\n+++ b/x\n@@ -1 +1 @@\n+x\n")
         with pytest.raises(RuntimeError, match="exceeds"):
             filter_test_control(b"x" * (MAX_PATCH_BYTES + 1))
+
+    def test_unattributable_header_rejected(self) -> None:
+        """Headers without both a/ and b/ tokens fail closed instead of being kept.
+
+        git config diff.srcPrefix/diff.dstPrefix can produce these; keeping the
+        section (as an older version of the filter did) would smuggle test-control
+        edits into the verifier.
+        """
+        from scripts.evals.short_swe.verified_verifier import filter_test_control
+
+        for header in (
+            "diff --git i/tests/conftest.py j/tests/conftest.py\n",
+            "diff --git a/tests/conftest.py j/tests/conftest.py\n",
+            "diff --git i/tests/conftest.py b/tests/conftest.py\n",
+        ):
+            patch = header + (
+                "index 1234567..89abcde 100644\n"
+                "--- i/tests/conftest.py\n"
+                "+++ j/tests/conftest.py\n"
+                "@@ -1 +1 @@\n"
+                "+assert True\n"
+            )
+            with pytest.raises(RuntimeError, match="no a/ or b/ path"):
+                filter_test_control(patch)
 
     def test_empty_and_multi_file(self) -> None:
         from scripts.evals.short_swe.verified_verifier import filter_test_control

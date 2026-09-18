@@ -27,10 +27,16 @@ def trusted_base_commit(task_dir: Path) -> str:
 
 def patch_collect_command(task_dir: Path) -> str:
     base = trusted_base_commit(task_dir)
+    # The candidate agent controls this sandbox, including its git config, so the
+    # collect command must not honor repo-local diff prefix settings: a candidate
+    # that sets diff.srcPrefix/diff.dstPrefix (or diff.mnemonicPrefix) would emit
+    # headers like "diff --git i/tests/conftest.py j/tests/conftest.py", which
+    # _patch_paths cannot attribute to a path. -c overrides any repo config.
     return (
         "rm -rf /logs/artifacts && "
         "git add -N -- . && "
-        f"git diff --binary --no-ext-diff {base} -- . > /tmp/prime-agent.patch"
+        "git -c diff.srcPrefix=a/ -c diff.dstPrefix=b/ -c diff.mnemonicPrefix=false "
+        f"diff --binary --no-ext-diff {base} -- . > /tmp/prime-agent.patch"
     )
 
 
@@ -78,7 +84,14 @@ def _decode_patch(raw: bytes | str) -> str:
 
 
 def _patch_paths(header: str) -> tuple[str, str]:
-    """Extract the a-side and b-side paths from a diff --git header."""
+    """Extract the a-side and b-side paths from a diff --git header.
+
+    A header that yields no a/ or b/ token cannot be attributed to a path, so it is
+    rejected instead of kept: git config (diff.srcPrefix, diff.dstPrefix, or
+    diff.mnemonicPrefix) can produce headers such as
+    ``diff --git i/tests/conftest.py j/tests/conftest.py``, and a kept-but-unattributed
+    section would smuggle test-control edits into the verifier.
+    """
     tokens = shlex.split(header)
     a_path = ""
     b_path = ""
@@ -87,6 +100,10 @@ def _patch_paths(header: str) -> tuple[str, str]:
             a_path = token[2:]
         elif token.startswith("b/") and not b_path:
             b_path = token[2:]
+    if not a_path or not b_path:
+        raise RuntimeError(
+            f"diff --git header has no a/ or b/ path; refusing to filter: {header.strip()[:80]!r}"
+        )
     return a_path, b_path
 
 
@@ -96,7 +113,9 @@ def filter_test_control(raw: bytes | str) -> str:
     The input may be raw bytes (as returned by Runtime.read) or text.
     Only diff --git headers are recognized; a patch without any
     recognized header is rejected so traditional header-less diffs
-    cannot bypass the filter.
+    cannot bypass the filter, and any header whose a/ or b/ path is
+    missing is rejected so diff-prefix tampering cannot smuggle
+    test-control edits through as unattributable sections.
     """
     patch = _decode_patch(raw)
     kept: list[str] = []
