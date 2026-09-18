@@ -33,6 +33,7 @@ vi.mock("../src/cli/daemon-update-restart.js", async (importOriginal) => ({
 import { buildDaemonUpdateRestartReport } from "../src/cli/daemon-update-restart.js";
 import {
 	buildUpdateRelaunchArgs,
+	formatDaemonReconnectBanner,
 	InteractiveMode,
 	tryExecUpdateRelaunch,
 } from "../src/modes/interactive/interactive-mode.js";
@@ -239,6 +240,20 @@ describe("interactive self-update relaunch", () => {
 			expect(execve.mock.calls[0]?.[1]).toEqual(expect.arrayContaining(["--resume", "/tmp/session.jsonl"]));
 		},
 	);
+});
+
+describe("formatDaemonReconnectBanner", () => {
+	it.each([
+		[undefined, "Daemon reconnected", "dim"],
+		["1.2.3", "Daemon restarted (v1.2.3) - reconnected", "dim"],
+		[
+			"2.0.0",
+			"Daemon restarted (v2.0.0), this window still runs v1.2.3 - restart the window to pick up the update.",
+			"warning",
+		],
+	])("maps daemon version %s to banner", (daemonVersion, message, tone) => {
+		expect(formatDaemonReconnectBanner(daemonVersion, "1.2.3")).toEqual({ message, tone });
+	});
 });
 
 describe("buildDaemonUpdateRestartReport", () => {
