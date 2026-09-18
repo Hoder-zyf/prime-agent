@@ -6888,6 +6888,12 @@ export class AgentSession {
 					if (this._isSessionInputHandoffDeferred(epoch)) {
 						throw new DeferredSessionInputError("Session input paused before preflight");
 					}
+					// Re-evaluate image routing for this batch before any pre-commit read of
+					// the serving model: pre-turn compaction must not follow the previous
+					// turn's override. Retries and post-compaction continuations of a routed
+					// turn re-read the override, so they keep serving it; the next dispatch
+					// overwrites it with its fresh decision.
+					this.agent.modelOverride = this._imageModelOverrideForTurns(activeTurns());
 				},
 				prepare: async () => {
 					if (executionPolicy.nextTurnContextTiming === "preparation") {
@@ -6971,10 +6977,6 @@ export class AgentSession {
 					const preparedMessages: AgentMessage[] = turns.flatMap((action) =>
 						action.payload.records.map((record) => record.message),
 					);
-					// Re-evaluate image routing for this turn batch. Retries and post-compaction
-					// continuations of a routed turn re-read the override, so they keep serving
-					// it; the next dispatch overwrites it with the fresh decision.
-					this.agent.modelOverride = this._imageModelOverrideForTurns(turns);
 					for (const action of turns) {
 						if (action.suppressAutonomousContinuation) {
 							this._markAutonomousContinuationSuppressed(primaryDeliveryRecord(action).message);

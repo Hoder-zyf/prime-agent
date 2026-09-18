@@ -4808,8 +4808,16 @@ export class InteractiveMode {
 			this.editor.insertTextAtCursor?.(formatImageMarker(markerId));
 			this.ui.requestRender();
 
-			if (!this.imageAttachmentsPossible()) {
-				this.showStatus("Current model does not support images; the attachment will be omitted.");
+			const model = this.getCurrentModel();
+			if (
+				model &&
+				!model.input.includes("image") &&
+				!this.settingsManager.getImageModel() &&
+				!this.settingsManager.getBlockImages()
+			) {
+				this.showStatus(
+					"Current model does not support images; set imageModel in settings.json or the turn will fail with setup guidance.",
+				);
 			}
 		} catch {
 			// Silently ignore clipboard errors (may not have permission, etc.)
@@ -4862,30 +4870,13 @@ export class InteractiveMode {
 	 * dequeue) brings it back. Marker presence in the sent text is the single
 	 * source of truth.
 	 *
-	 * Resolved against the current model: if it has no image input, attachments
-	 * are dropped here (matching the paste-time hint) rather than sent and
-	 * downgraded downstream — unless settings.imageModel routes image turns to
-	 * an image-capable model, in which case the attachment reaches the session
-	 * and the dispatch-time routing or refusal decides what happens.
+	 * Attachments always reach the session: a text-only session model is either
+	 * routed to settings.imageModel at dispatch or the turn fails there with an
+	 * actionable setup error, so nothing is silently downgraded downstream.
 	 */
 	private collectImagesFor(text: string): ImageContent[] | undefined {
-		if (!this.imageAttachmentsPossible()) {
-			return undefined;
-		}
 		const images = collectMarkedImages(this.pastedImages, text);
 		return images.length > 0 ? images : undefined;
-	}
-
-	/**
-	 * Whether image attachments can reach a model at all: the current model
-	 * takes image input, or settings.imageModel routes image turns to one that
-	 * does. An unusable imageModel still fails the routed turn at dispatch with
-	 * an actionable error, which is more honest than dropping the paste.
-	 */
-	private imageAttachmentsPossible(): boolean {
-		const model = this.getCurrentModel();
-		if (!model || model.input.includes("image")) return true;
-		return this.settingsManager.getImageModel() !== undefined;
 	}
 
 	private hasPastedImagesFor(text: string): boolean {
