@@ -79,35 +79,35 @@
       "label": "Claude Code",
       "tasksets": {
         "swebench-verified": {
-          "resolved": 13,
+          "resolved": 12,
           "tasks": 15,
-          "uncached_input_tokens": 314000,
-          "cached_input_tokens": 11150000,
-          "output_tokens": 75500,
+          "uncached_input_tokens": 2476452,
+          "cached_input_tokens": 46053376,
+          "output_tokens": 1475250,
           "measured": true
         },
         "swebench-pro": {
-          "resolved": 5,
+          "resolved": 6,
           "tasks": 8,
-          "uncached_input_tokens": 548000,
-          "cached_input_tokens": 17920000,
-          "output_tokens": 96700,
+          "uncached_input_tokens": 1280056,
+          "cached_input_tokens": 23324672,
+          "output_tokens": 287563,
           "measured": true
         },
         "scaleswe": {
           "resolved": 3,
           "tasks": 5,
-          "uncached_input_tokens": 323000,
-          "cached_input_tokens": 10210000,
-          "output_tokens": 24400,
+          "uncached_input_tokens": 806904,
+          "cached_input_tokens": 14674944,
+          "output_tokens": 683901,
           "measured": true
         }
       },
       "model_failures": 0,
-      "e2e_seconds": 8151.0,
+      "e2e_seconds": 0.0,
       "measured_at": "2026-09-18T00:00:00Z",
-      "source": "Fresh eval Sept 18 2026, claude-code 2.1.274 with claude-opus-5 via Prime Inference, Prime sandbox per task, official scoring; all 28 tasks",
-      "model": "claude-opus-5"
+      "source": "Same-model re-eval Sept 18 2026, claude-code 2.1.274 with internal/glm-5.3-fast via Prime Inference (Anthropic-compatible), 3600s rollout budget, official scoring; all 28 tasks",
+      "model": "internal/glm-5.3-fast"
     },
     {
       "harness": "swe-agent",
