@@ -781,6 +781,9 @@ class TestFilterTestControl:
             ("src/none.py", "tests/conftest.py", False),
             ("pyproject.toml", "pyproject.toml", False),
             ("tests/test_foo.py", "tests/test_foo.py", False),
+            ("tests/helpers.py", "tests/helpers.py", False),
+            ("src/mod.py", "tests/__init__.py", False),
+            ("pkg/tests/fixture.py", "pkg/tests/fixture.py", False),
         ],
     )
     def test_filter_paths(self, a: str, b: str, kept: bool) -> None:

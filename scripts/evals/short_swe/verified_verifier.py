@@ -63,7 +63,7 @@ MAX_PATCH_BYTES = 16 * 1024 * 1024
 # in the verifier sandbox because the pinned test metadata is the contract.
 TEST_CONTROL = re.compile(
     r"^(?:[^/]+/)*"
-    r"(?:conftest\.py|\.?pytest\.ini|tox\.ini|pyproject\.toml|setup\.cfg|"
+    r"(?:tests(?:/.*)?|conftest\.py|\.?pytest\.ini|tox\.ini|pyproject\.toml|setup\.cfg|"
     r"test_[^/]*\.py|[^/]*_test\.py)$"
 )
 
