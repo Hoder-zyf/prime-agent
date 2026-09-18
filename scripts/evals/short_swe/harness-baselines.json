@@ -114,7 +114,7 @@
       "label": "SWE Agent",
       "tasksets": {
         "swebench-verified": {
-          "resolved": 0,
+          "resolved": 10,
           "tasks": 15,
           "uncached_input_tokens": 0,
           "cached_input_tokens": 0,
@@ -122,7 +122,7 @@
           "measured": false
         },
         "swebench-pro": {
-          "resolved": 0,
+          "resolved": 1,
           "tasks": 8,
           "uncached_input_tokens": 0,
           "cached_input_tokens": 0,
@@ -130,7 +130,7 @@
           "measured": false
         },
         "scaleswe": {
-          "resolved": 0,
+          "resolved": 2,
           "tasks": 5,
           "uncached_input_tokens": 0,
           "cached_input_tokens": 0,
@@ -140,9 +140,9 @@
       },
       "model_failures": 0,
       "e2e_seconds": 0.0,
-      "measured_at": "1970-01-01T00:00:00Z",
-      "source": "Not yet measured",
-      "model": "not yet measured"
+      "measured_at": "2026-09-18T00:00:00Z",
+      "source": "Fresh eval Sept 18 2026, SWE-agent 1.1.0, model deepseek-v4.1-flash via Prime Inference, Prime VM sandbox per task, official swebench 4.0.3 + Pro + ScaleSWE scoring; all 28 tasks",
+      "model": "deepseek-v4.1-flash"
     },
     {
       "harness": "bash-edit",
