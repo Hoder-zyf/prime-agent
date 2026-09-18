@@ -182,6 +182,8 @@ def validate_baselines(document: dict) -> dict[str, dict]:
         for ts_id, ts in tasksets.items():
             if not isinstance(ts, dict):
                 raise ValueError(f"invalid taskset entry for {harness}/{ts_id}")
+            if not isinstance(ts.get("measured"), bool):
+                raise ValueError(f"invalid harness baseline measured for {harness}/{ts_id}")
             expected = TASKSET_SIZES[ts_id]
             if ts.get("tasks") != expected:
                 raise ValueError(f"harness baseline {harness}/{ts_id} must list {expected} tasks")
@@ -239,7 +241,7 @@ def render_baselines(measured: dict[str, dict]) -> list[str]:
                 else:
                     cells.append(f"?/{ts['tasks']}" if ts else f"?/{TASKSET_SIZES[ts_id]}")
             total = sum(ts.get("resolved", 0) for ts in tasksets.values() if ts.get("measured"))
-            total_tasks = sum(ts["tasks"] for ts in tasksets.values())
+            total_tasks = sum(ts["tasks"] for ts in tasksets.values() if ts.get("measured"))
             if any(ts.get("measured") for ts in tasksets.values()):
                 lines.append(f"| {label} | {' | '.join(cells)} | {total}/{total_tasks} |")
             else:
@@ -267,9 +269,11 @@ def render_baselines(measured: dict[str, dict]) -> list[str]:
             lines.append(f"| {label} | ? | ? | ? |")
         else:
             tasksets = entry["tasksets"]
-            uncached = sum(ts.get("uncached_input_tokens", 0) for ts in tasksets.values())
-            cached = sum(ts.get("cached_input_tokens", 0) for ts in tasksets.values())
-            output = sum(ts.get("output_tokens", 0) for ts in tasksets.values())
+            uncached = sum(
+                ts.get("uncached_input_tokens", 0) for ts in tasksets.values() if ts.get("measured")
+            )
+            cached = sum(ts.get("cached_input_tokens", 0) for ts in tasksets.values() if ts.get("measured"))
+            output = sum(ts.get("output_tokens", 0) for ts in tasksets.values() if ts.get("measured"))
             if any(ts.get("measured") for ts in tasksets.values()):
                 lines.append(f"| {label} | {uncached:,} | {cached:,} | {output:,} |")
             else:

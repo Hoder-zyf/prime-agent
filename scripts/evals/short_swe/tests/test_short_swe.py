@@ -589,8 +589,8 @@ def _baselines_doc(measured_harness: str | None = None) -> dict:
         "description": "Static harness baselines on the 28-task Short SWE suite",
         "model": "internal/glm-5.3-fast",
         "baselines": [
-            _baseline_v2(h, l, resolved=3, measured=(h == measured_harness))
-            for h, l in report.HARNESS_LABELS.items()
+            _baseline_v2(h, label, resolved=3, measured=(h == measured_harness))
+            for h, label in report.HARNESS_LABELS.items()
         ],
     }
 
