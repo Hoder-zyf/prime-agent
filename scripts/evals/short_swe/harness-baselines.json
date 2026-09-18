@@ -114,35 +114,35 @@
       "label": "SWE Agent",
       "tasksets": {
         "swebench-verified": {
-          "resolved": 10,
+          "resolved": 11,
           "tasks": 15,
-          "uncached_input_tokens": 4067040,
-          "cached_input_tokens": 10183552,
-          "output_tokens": 406209,
+          "uncached_input_tokens": 2288590,
+          "cached_input_tokens": 8957952,
+          "output_tokens": 145302,
           "measured": true
         },
         "swebench-pro": {
-          "resolved": 1,
+          "resolved": 2,
           "tasks": 8,
-          "uncached_input_tokens": 5457547,
-          "cached_input_tokens": 14349632,
-          "output_tokens": 421654,
+          "uncached_input_tokens": 3844170,
+          "cached_input_tokens": 8013824,
+          "output_tokens": 175265,
           "measured": true
         },
         "scaleswe": {
-          "resolved": 2,
+          "resolved": 3,
           "tasks": 5,
-          "uncached_input_tokens": 3448785,
-          "cached_input_tokens": 12754432,
-          "output_tokens": 165767,
+          "uncached_input_tokens": 1901909,
+          "cached_input_tokens": 5091328,
+          "output_tokens": 58997,
           "measured": true
         }
       },
       "model_failures": 0,
       "e2e_seconds": 0.0,
       "measured_at": "2026-09-18T00:00:00Z",
-      "source": "Fresh eval Sept 18 2026, SWE-agent 1.1.0, model deepseek-v4.1-flash via Prime Inference, Prime VM sandbox per task, official swebench 4.0.3 + Pro + ScaleSWE scoring; all 28 tasks",
-      "model": "deepseek-v4.1-flash"
+      "source": "Same-model re-eval Sept 18 2026, SWE-agent 1.1.0 with internal/glm-5.3-fast via Prime Inference, Prime VM sandbox per task, official scoring; all 28 tasks, 0 failures, avg 124-259s/task",
+      "model": "internal/glm-5.3-fast"
     },
     {
       "harness": "bash-edit",
