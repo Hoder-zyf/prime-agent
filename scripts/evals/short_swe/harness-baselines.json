@@ -79,35 +79,35 @@
       "label": "Claude Code",
       "tasksets": {
         "swebench-verified": {
-          "resolved": 7,
+          "resolved": 13,
           "tasks": 15,
-          "uncached_input_tokens": 0,
-          "cached_input_tokens": 0,
-          "output_tokens": 289758,
+          "uncached_input_tokens": 314000,
+          "cached_input_tokens": 11150000,
+          "output_tokens": 75500,
           "measured": true
         },
         "swebench-pro": {
-          "resolved": 4,
+          "resolved": 5,
           "tasks": 8,
-          "uncached_input_tokens": 0,
-          "cached_input_tokens": 0,
-          "output_tokens": 0,
+          "uncached_input_tokens": 548000,
+          "cached_input_tokens": 17920000,
+          "output_tokens": 96700,
           "measured": true
         },
         "scaleswe": {
-          "resolved": 4,
+          "resolved": 3,
           "tasks": 5,
-          "uncached_input_tokens": 0,
-          "cached_input_tokens": 0,
-          "output_tokens": 0,
+          "uncached_input_tokens": 323000,
+          "cached_input_tokens": 10210000,
+          "output_tokens": 24400,
           "measured": true
         }
       },
       "model_failures": 0,
-      "e2e_seconds": 8461.6,
-      "measured_at": "2026-09-02T00:00:00Z",
-      "source": "Sept 2026 campaign, deepseek/deepseek-v4-flash; mean 302.2 s/episode; input tokens not recorded",
-      "model": "deepseek/deepseek-v4-flash"
+      "e2e_seconds": 8151.0,
+      "measured_at": "2026-09-18T00:00:00Z",
+      "source": "Fresh eval Sept 18 2026, claude-code 2.1.274 with claude-opus-5 via Prime Inference, Prime sandbox per task, official scoring; all 28 tasks",
+      "model": "claude-opus-5"
     },
     {
       "harness": "swe-agent",
