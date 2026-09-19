@@ -182,6 +182,7 @@ prime-agent --offline
 | `retry.baseDelayMs` | number | `2000` | Base delay for agent-level exponential backoff (2s, 4s, 8s) |
 | `retry.provider.timeoutMs` | number | SDK default | Provider/SDK request timeout in milliseconds |
 | `retry.provider.maxRetryDelayMs` | number | `60000` | Max server-requested retry delay before failing (60s) |
+| `requestTiming` | boolean | `false` | Log per-request provider timing phases to the diagnostic log (see [Development: Request timing](development.md#request-timing)); `PI_REQUEST_TIMING=1` also enables it |
 
 When a provider requests a retry delay longer than `retry.provider.maxRetryDelayMs` (e.g. a usage-limit reset hours away), auto-retry stops immediately with an informative error instead of waiting. Set to `0` to disable the cap.
 
