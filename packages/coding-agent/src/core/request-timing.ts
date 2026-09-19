@@ -177,18 +177,22 @@ export class RequestTiming {
 		this.streamFnEnteredAt = performance.now();
 	}
 
-	/** request-sent: payload handed to the provider client, with the serialized request body size. */
-	markRequestSent(requestBytes: number | undefined): void {
+	/** request-sent: payload handed to the provider client. */
+	markRequestSent(): void {
+		if (this.requestSentAt !== undefined) return;
 		const now = performance.now();
 		this.requestSentAt = now;
-		this.requestBytes = requestBytes;
 		const from = this.promptBuiltAt ?? this.streamFnEnteredAt;
 		this.emit("request-sent", {
 			phaseMs: roundMs(now - from),
 			totalMs: this.totalFromDispatch(now),
 			contextEntries: this.contextEntries,
-			requestBytes,
 		});
+	}
+
+	/** Serialized request body size, measured after request-sent so its cost is not charged to the client phase. */
+	recordRequestBytes(requestBytes: number | undefined): void {
+		this.requestBytes = requestBytes;
 	}
 
 	/** first-byte: HTTP response headers received (provider TTFB complete). */
@@ -199,6 +203,9 @@ export class RequestTiming {
 		const from = this.requestSentAt ?? this.promptBuiltAt ?? this.streamFnEnteredAt;
 		this.emit("first-byte", {
 			phaseMs: roundMs(now - from),
+			// Without a request-sent timestamp (provider never called onPayload) the
+			// delta spans from prompt-built, not just the wire wait.
+			...(this.requestSentAt === undefined ? { phaseFrom: "prompt-built" } : {}),
 			totalMs: this.totalFromDispatch(now),
 			requestBytes: this.requestBytes,
 		});
@@ -339,7 +346,10 @@ export function instrumentStreamFn(enabled: RequestTimingEnabled, streamFn: Stre
 				...options,
 				onPayload: async (payload, payloadModel) => {
 					const next = await options?.onPayload?.(payload, payloadModel);
-					timing.markRequestSent(measureRequestBytes(next ?? payload));
+					timing.markRequestSent();
+					// Measured after request-sent so the serialization cost stays out of
+					// the client-side build delta; first-byte and summary carry the size.
+					timing.recordRequestBytes(measureRequestBytes(next ?? payload));
 					return next;
 				},
 				onResponse: async (response, responseModel) => {
@@ -347,7 +357,7 @@ export function instrumentStreamFn(enabled: RequestTimingEnabled, streamFn: Stre
 					await options?.onResponse?.(response, responseModel);
 				},
 			});
-			return wrapRequestTimingEventStream(stream, timing);
+			return wrapRequestTimingEventStream(stream, timing, options?.signal);
 		} catch (error) {
 			timing.emitSummary("failed");
 			throw error;
@@ -371,51 +381,73 @@ function takePromptBuild(llmMessages: object[]): PromptBuildTiming | undefined {
 export function wrapRequestTimingEventStream(
 	stream: AssistantMessageEventStream,
 	timing: RequestTiming,
+	signal?: AbortSignal,
 ): AssistantMessageEventStream {
-	const wrapped = {
-		async *[Symbol.asyncIterator]() {
+	// Delegates to the provider stream so result/push/end (and instanceof checks)
+	// keep working; only iteration is overridden to observe phases.
+	const wrapped = Object.create(stream);
+	Object.defineProperty(wrapped, Symbol.asyncIterator, {
+		value: async function* () {
 			try {
-				for await (const event of stream) {
-					switch (event?.type) {
-						case "start":
-							// Providers push start after response headers; used only when onResponse did not fire.
-							timing.markFirstByte();
-							break;
-						case "done":
-							timing.markStreamDone(event.message.stopReason, event.message.errorMessage);
-							timing.markUsage({
-								input: event.message.usage.input,
-								output: event.message.usage.output,
-								cacheRead: event.message.usage.cacheRead,
-								cacheWrite: event.message.usage.cacheWrite,
-							});
-							timing.emitSummary("done");
-							break;
-						case "error":
-							timing.markStreamDone(event.error.stopReason, event.error.errorMessage);
-							timing.markUsage({
-								input: event.error.usage.input,
-								output: event.error.usage.output,
-								cacheRead: event.error.usage.cacheRead,
-								cacheWrite: event.error.usage.cacheWrite,
-							});
-							timing.emitSummary("done");
-							break;
-						default:
-							if (event && isRequestTimingFirstTokenEvent(event.type)) {
-								timing.markFirstToken();
-							}
-							break;
+				try {
+					for await (const event of stream) {
+						switch (event?.type) {
+							case "start":
+								// Providers push start after response headers; used only when onResponse did not fire.
+								timing.markFirstByte();
+								break;
+							case "done":
+								timing.markStreamDone(event.message.stopReason, event.message.errorMessage);
+								timing.markUsage({
+									input: event.message.usage.input,
+									output: event.message.usage.output,
+									cacheRead: event.message.usage.cacheRead,
+									cacheWrite: event.message.usage.cacheWrite,
+								});
+								timing.emitSummary("done");
+								break;
+							case "error":
+								timing.markStreamDone(event.error.stopReason, event.error.errorMessage);
+								timing.markUsage({
+									input: event.error.usage.input,
+									output: event.error.usage.output,
+									cacheRead: event.error.usage.cacheRead,
+									cacheWrite: event.error.usage.cacheWrite,
+								});
+								// A terminal provider error is a failed (or aborted) request, not a completed one.
+								timing.emitSummary(event.error.stopReason === "aborted" ? "aborted" : "failed");
+								break;
+							default:
+								if (event && isRequestTimingFirstTokenEvent(event.type)) {
+									timing.markFirstToken();
+								}
+								break;
+						}
+						yield event;
 					}
-					yield event;
+				} catch (error) {
+					// A provider-side crash is a failed request, not a user abort; an
+					// abort-driven rejection still reports as aborted. The error is
+					// re-thrown so the consumer still sees the failure.
+					const errorMessage = error instanceof Error ? error.message : String(error);
+					if (signal?.aborted) {
+						timing.markStreamDone("aborted", errorMessage);
+						timing.emitSummary("aborted");
+					} else {
+						timing.markStreamDone("error", errorMessage);
+						timing.emitSummary("failed");
+					}
+					throw error;
 				}
 			} finally {
 				// Early termination (abort, hung stream) still reports what was measured.
 				timing.emitSummary("aborted");
 			}
 		},
-		result: () => stream.result(),
-	};
+		enumerable: true,
+		writable: true,
+		configurable: true,
+	});
 	return wrapped as unknown as AssistantMessageEventStream;
 }
 

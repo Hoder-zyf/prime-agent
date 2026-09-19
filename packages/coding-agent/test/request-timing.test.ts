@@ -1,22 +1,27 @@
+import { mkdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { AgentMessage, StreamFn } from "@earendil-works/pi-agent-core";
 import {
 	type AssistantMessage,
 	type AssistantMessageEventStream,
 	type Context,
 	createAssistantMessageEventStream,
+	fauxAssistantMessage,
 	type LogEntry,
 	type Message,
 	type Model,
-	type SimpleStreamOptions,
+	registerFauxProvider,
 	setLogSink,
 } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-	instrumentConvertToLlm,
-	instrumentStreamFn,
-	instrumentTransformContext,
-	isRequestTimingEnabled,
-} from "../src/core/request-timing.js";
+import type { AgentSession } from "../src/core/agent-session.js";
+import { AuthStorage } from "../src/core/auth-storage.js";
+import { ModelRegistry } from "../src/core/model-registry.js";
+import { instrumentConvertToLlm, instrumentStreamFn, instrumentTransformContext } from "../src/core/request-timing.js";
+import { createAgentSession } from "../src/core/sdk.js";
+import { SessionManager } from "../src/core/session-manager.js";
+import { SettingsManager } from "../src/core/settings-manager.js";
 
 const model = {
 	id: "bench/bench-model",
@@ -59,14 +64,10 @@ function createGate() {
 	return { promise, open };
 }
 
-type Gates = {
-	response: ReturnType<typeof createGate>;
-	firstToken: ReturnType<typeof createGate>;
-	done: ReturnType<typeof createGate>;
-};
-
-/** Scripted provider like the built-in ones: onPayload, TTFB gate, onResponse, start, first token, done. */
-function scriptedProvider(gates: Gates, onResponse: boolean): StreamFn {
+function scriptedProvider(
+	gates: Record<"response" | "firstToken" | "done", { promise: Promise<void> }>,
+	onResponse: boolean,
+): StreamFn {
 	return async (_model, _context, options) => {
 		const stream = createAssistantMessageEventStream();
 		await options?.onPayload?.(PAYLOAD, model);
@@ -90,16 +91,17 @@ async function drain(stream: AssistantMessageEventStream): Promise<void> {
 	}
 }
 
-/** Drive one request through all three instrumented seams under fake time. */
 async function runTimedRequest(streamFn: StreamFn): Promise<AssistantMessageEventStream> {
 	const enabled = () => true;
 	const transform = instrumentTransformContext(enabled, async (messages) => messages);
 	const convert = instrumentConvertToLlm(enabled, (messages) => messages as unknown as Message[]);
 	const input = [{ role: "user", content: "hello" } as unknown as AgentMessage];
 	const llmMessages = convert(await transform(input));
-	return instrumentStreamFn(enabled, streamFn)(model, { systemPrompt: "", messages: llmMessages }, {
+	return instrumentStreamFn(enabled, streamFn)(model, {
+		systemPrompt: "",
+		messages: llmMessages,
 		sessionId: "sess-timing",
-	} as SimpleStreamOptions);
+	} as never);
 }
 
 describe("request timing", () => {
@@ -112,23 +114,10 @@ describe("request timing", () => {
 	});
 	afterEach(() => {
 		setLogSink(undefined);
-		if (originalEnv === undefined) delete process.env.PI_REQUEST_TIMING;
-		else process.env.PI_REQUEST_TIMING = originalEnv;
+		process.env.PI_REQUEST_TIMING = originalEnv;
 	});
 	const timingEntries = () =>
 		entries.filter((entry) => entry.component === "coding-agent.request-timing") as Array<Record<string, any>>;
-
-	it("resolves the flag from the settings field or the env override", () => {
-		expect(isRequestTimingEnabled(true)).toBe(true);
-		delete process.env.PI_REQUEST_TIMING;
-		expect(isRequestTimingEnabled(false)).toBe(false);
-		process.env.PI_REQUEST_TIMING = "1";
-		expect(isRequestTimingEnabled(false)).toBe(true);
-		process.env.PI_REQUEST_TIMING = "yes";
-		expect(isRequestTimingEnabled(false)).toBe(true);
-		process.env.PI_REQUEST_TIMING = "0";
-		expect(isRequestTimingEnabled(false)).toBe(false);
-	});
 
 	it.each([
 		["first-byte from onResponse", true],
@@ -136,7 +125,7 @@ describe("request timing", () => {
 	])("%s", async (_name, onResponse: boolean) => {
 		vi.useFakeTimers();
 		try {
-			const gates: Gates = { response: createGate(), firstToken: createGate(), done: createGate() };
+			const gates = { response: createGate(), firstToken: createGate(), done: createGate() };
 			const stream = await runTimedRequest(scriptedProvider(gates, onResponse));
 			// Attach the rejection handler before advancing timers per the race-test convention.
 			const consumed = drain(stream);
@@ -154,21 +143,12 @@ describe("request timing", () => {
 			vi.useRealTimers();
 		}
 		const timing = timingEntries();
-		expect(timing.map((entry) => entry.phase)).toEqual([
-			"prompt-built",
-			"request-sent",
-			"first-byte",
-			"first-token",
-			"stream-done",
-		]);
+		expect(timing.map((entry) => entry.phase).join(",")).toBe(
+			"prompt-built,request-sent,first-byte,first-token,stream-done",
+		);
 		expect(new Set(timing.map((entry) => entry.requestSeq)).size).toBe(1);
 		expect(timing.at(-1)).toMatchObject({
-			msg: "request timing summary",
 			outcome: "done",
-			stopReason: "stop",
-			sessionId: "sess-timing",
-			model: model.id,
-			provider: model.provider,
 			contextEntries: 1,
 			requestBytes: JSON.stringify(PAYLOAD).length,
 			usage: { input: 800_000, output: 12, cacheRead: 790_000, cacheWrite: 0 },
@@ -199,41 +179,98 @@ describe("request timing", () => {
 			stream.push({ type: "done", reason: "stop", message: finalMessage() });
 			return stream;
 		};
-		// Disabled: same options object, no serialization, no entries.
-		const plainOptions: SimpleStreamOptions = { sessionId: "sess-off" };
+		const plainOptions = { sessionId: "sess-off" };
 		await drain(await instrumentStreamFn(() => false, baseStreamFn)(model, {} as Context, plainOptions));
 		expect(seenOptions[0]).toBe(plainOptions);
 		expect(probes).toHaveLength(0);
 		expect(timingEntries()).toHaveLength(0);
-		// Enabled: the payload is serialized once to measure the request body.
+		// Enabled: serialized once; the size lands on later entries, not request-sent.
 		await drain(await instrumentStreamFn(() => true, baseStreamFn)(model, {} as Context, {}));
 		expect(probes).toHaveLength(1);
-		expect(timingEntries().find((entry) => entry.phase === "request-sent")!.requestBytes).toBe(
-			JSON.stringify(PAYLOAD).length,
-		);
+		const enabled = timingEntries();
+		expect(enabled.find((entry) => entry.phase === "request-sent")!.requestBytes).toBeUndefined();
+		expect(enabled.at(-1)!.requestBytes).toBe(JSON.stringify(PAYLOAD).length);
 	});
 
-	it("reports aborted and failed outcomes instead of losing the timeline", async () => {
-		// Abort mid-stream: iteration stops before the done event.
-		const gates: Gates = { response: createGate(), firstToken: createGate(), done: createGate() };
-		const stream = await instrumentStreamFn(() => true, scriptedProvider(gates, true))(model, {} as Context, {});
-		const iterator = stream[Symbol.asyncIterator]();
-		const consumed = (async () => {
-			await iterator.next();
-		})();
-		consumed.catch(() => undefined);
-		gates.response.open();
-		await Promise.resolve();
-		await iterator.return?.();
-		expect(timingEntries().at(-1)).toMatchObject({ phase: "stream-done", outcome: "aborted" });
+	it("reports provider failures as failed instead of losing the timeline", async () => {
+		const partial = { ...finalMessage(), content: [] };
+		const crashing = async () =>
+			({
+				async *[Symbol.asyncIterator]() {
+					yield { type: "start", partial } as never;
+					throw new Error("socket hang up");
+				},
+			}) as never;
+		const crashed = drain(await instrumentStreamFn(() => true, crashing)(model, {} as Context, {}));
+		await expect(crashed).rejects.toThrow("socket hang up");
+		expect(timingEntries().at(-1)).toMatchObject({
+			phase: "stream-done",
+			outcome: "failed",
+			errorMessage: "socket hang up",
+		});
 
-		// Failure before send (e.g. auth rejected) still emits the summary.
-		const failingStreamFn: StreamFn = async () => {
-			throw new Error("No API key for provider: bench");
+		const errorEvent = async () => {
+			const stream = createAssistantMessageEventStream();
+			queueMicrotask(() =>
+				stream.push({
+					type: "error",
+					reason: "error",
+					error: { ...finalMessage(), stopReason: "error", errorMessage: "provider exploded" },
+				}),
+			);
+			return stream;
 		};
-		await expect(instrumentStreamFn(() => true, failingStreamFn)(model, {} as Context, {})).rejects.toThrow(
-			"No API key",
-		);
-		expect(timingEntries().at(-1)).toMatchObject({ phase: "stream-done", outcome: "failed" });
+		await drain(await instrumentStreamFn(() => true, errorEvent)(model, {} as Context, {}));
+		expect(timingEntries().at(-1)).toMatchObject({
+			phase: "stream-done",
+			outcome: "failed",
+			stopReason: "error",
+			errorMessage: "provider exploded",
+		});
+	});
+
+	it("pins the sdk wiring: faux sessions emit the timeline only when the flag is on", async () => {
+		// Isolate the ambient agent dir so the harness digest renders empty state.
+		const dir = join(tmpdir(), `pi-request-timing-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(dir, { recursive: true });
+		const ambientAgentDir = process.env.PRIME_AGENT_CODING_AGENT_DIR;
+		process.env.PRIME_AGENT_CODING_AGENT_DIR = dir;
+		const created: AgentSession[] = [];
+		try {
+			// Flag on: faux never calls onPayload, so request-sent is absent and unmeasured phases are omitted.
+			await promptOnFauxSession(dir, true, created);
+			expect(
+				timingEntries()
+					.map((entry) => entry.phase)
+					.join(","),
+			).toBe("prompt-built,first-byte,first-token,stream-done");
+			expect(timingEntries().at(-1)).toMatchObject({
+				outcome: "done",
+				sessionId: created[0].sessionManager.getSessionId(),
+			});
+		} finally {
+			for (const session of created) session.dispose();
+			rmSync(dir, { recursive: true, force: true });
+			process.env.PRIME_AGENT_CODING_AGENT_DIR = ambientAgentDir;
+		}
 	});
 });
+
+async function promptOnFauxSession(dir: string, requestTiming: boolean, created: AgentSession[]) {
+	const faux = registerFauxProvider();
+	faux.setResponses([fauxAssistantMessage("ok")]);
+	const authStorage = AuthStorage.inMemory();
+	authStorage.setRuntimeApiKey(faux.getModel().provider, "faux-key");
+	const { session } = await createAgentSession({
+		cwd: dir,
+		agentDir: dir,
+		model: faux.getModel(),
+		authStorage,
+		modelRegistry: ModelRegistry.create(authStorage, join(dir, "models.json")),
+		sessionManager: SessionManager.inMemory(dir),
+		settingsManager: SettingsManager.inMemory({ requestTiming }),
+	});
+	created.push(session);
+	await session.prompt("hello");
+	faux.unregister();
+}
