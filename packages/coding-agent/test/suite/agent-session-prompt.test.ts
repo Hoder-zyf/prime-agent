@@ -1011,7 +1011,7 @@ describe("Harness digest at cold boundaries", () => {
 		mkdirSync(join(agentDir, "harness"), { recursive: true });
 		writeFileSync(
 			join(agentDir, "harness", "harness_state.json"),
-			'{"schema":1,"entries":{"prompt":{},"skill":{},"subagent":{},"memory":{"broken_memory":{"id":"broken_memory","kind":"memory","title":"Breaking memory","content":["one string"],"path":"arc","scope":"global","version":1},"valid_memory":{"id":"valid_memory","kind":"memory","title":"Valid memory","content":"Worktree workflow notes.","path":"general","scope":"global","version":1}}},"refinements":[{"id":"refine_bad","trigger":["not a string"],"changes":[],"evidence":"","outcome":""}]}',
+			'{"schema":1,"entries":{"prompt":{},"skill":{},"subagent":{},"memory":{"broken_memory":{"id":"broken_memory","kind":"memory","title":"Breaking memory","content":["one string"],"path":"arc","scope":"global","version":1},"valid_memory":{"id":"valid_memory","kind":"memory","title":"Valid memory","content":"Worktree workflow notes.","path":"general","scope":"global","version":1}}},"refinements":[{"id":"refine_bad","trigger":["not a string"],"changes":[],"evidence":"","outcome":""},null,"RAWLEAK-5f1e"]}',
 		);
 
 		const harness = await createHarness({ persistSession: true });
@@ -1024,6 +1024,10 @@ describe("Harness digest at cold boundaries", () => {
 		const digest = getMessageText(digests[0]);
 		expect(digest).toContain("harness: skipped malformed entry broken_memory (content not a string)");
 		expect(digest).toContain("harness: skipped malformed refinement event refine_bad (trigger not a string)");
+		expect(digest).toContain("harness: skipped malformed refinement event null (event not an object)");
+		// Non-object elements are labeled by type only: the raw value must not leak.
+		expect(digest).toContain("harness: skipped malformed refinement event a string (event not an object)");
+		expect(digest).not.toContain("RAWLEAK-5f1e");
 		expect(digest).toContain("[global:valid_memory]");
 		// The malformed content itself must never leak into the digest.
 		expect(digest).not.toContain("one string");

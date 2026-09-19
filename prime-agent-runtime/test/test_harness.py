@@ -374,6 +374,8 @@ class HarnessStateTest(unittest.TestCase):
                 ("title list", dict(title=["T"], content="c"), "title must be a non-empty string, got a list"),
                 ("empty title", dict(title="", content="c"), "title must be a non-empty string, got an empty string"),
                 ("numeric id", dict(title="T", content="c", id=7), "id must be a non-empty string, got int"),
+                ("unhashable list id", dict(title="T", content="c", id=["x"]), "id must be a non-empty string, got a list"),
+                ("falsy numeric id", dict(title="Zero", content="c", id=0), "id must be a non-empty string, got int"),
                 ("numeric path", dict(title="T", content="c", path=7), "path must be a non-empty string, got int"),
                 ("list metadata", dict(title="T", content="c", metadata=["m"]), "metadata must be a dict when provided, got a list"),
             ]:
@@ -387,7 +389,9 @@ class HarnessStateTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "skill entries require a Python reference"):
                     state.create("skill", "Skill", "content", id="orphan_skill")
             with self.subTest(case="skill reference as a list"):
-                with self.assertRaisesRegex(ValueError, "skill entries require a Python reference"):
+                with self.assertRaisesRegex(
+                    ValueError, "skill entry 'Skill' rejected: skill entries require a Python reference"
+                ):
                     state.create_skill("Skill", "content", reference=["bad"])
             with self.subTest(case="update with list content"):
                 with self.assertRaisesRegex(ValueError, "content must be a non-empty string, got a list"):
@@ -396,6 +400,7 @@ class HarnessStateTest(unittest.TestCase):
             with self.subTest(case="invalid refinement events"):
                 for label, kwargs, message in [
                     ("trigger list", dict(trigger=["t"], changes="ok"), "trigger must be a non-empty string, got a list"),
+                    ("event id list", dict(trigger="t", changes="ok", id=["x"]), "id must be a non-empty string when provided, got a list"),
                     ("changes int", dict(trigger="t", changes=7), "changes must be a string or a list of strings, got int"),
                     ("mixed changes", dict(trigger="t", changes=["ok", 2]), "changes must be a list of non-empty strings"),
                     ("evidence list", dict(trigger="t", changes="ok", evidence=["e"]), "evidence must be a string"),

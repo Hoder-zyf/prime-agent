@@ -201,16 +201,23 @@ _ENTRY_FIELDS = {field.name for field in fields(HarnessEntry)}
 _REFINEMENT_FIELDS = {field.name for field in fields(RefinementEvent)}
 
 
-def _validate_python_skill_reference(reference: dict[str, Any] | None) -> dict[str, Any]:
+def _validate_python_skill_reference(reference: dict[str, Any] | None, entry_name: str = "") -> dict[str, Any]:
+    # Rejections name the entry so the caller can repair the right skill; the
+    # suffix keeps the historical message text greppable.
+    prefix = f"skill entry {entry_name!r} rejected: " if entry_name else ""
+
+    def reject(message: str) -> None:
+        raise ValueError(f"{prefix}{message}")
+
     if not isinstance(reference, dict):
-        raise ValueError("skill entries require a Python reference")
+        reject("skill entries require a Python reference")
     normalized = dict(reference)
     if normalized.get("type") != "python":
-        raise ValueError("skill reference.type must be 'python'")
+        reject("skill reference.type must be 'python'")
     if not any(isinstance(normalized.get(key), str) and normalized[key] for key in ("import", "python_import")):
-        raise ValueError("skill reference requires a Python import")
+        reject("skill reference requires a Python import")
     if not any(isinstance(normalized.get(key), str) and normalized[key] for key in ("callable", "call_pattern")):
-        raise ValueError("skill reference requires a callable or call_pattern")
+        reject("skill reference requires a callable or call_pattern")
     return normalized
 
 
@@ -286,7 +293,7 @@ def _validate_entry_shape(
             if existing is None:
                 raise ValueError(f"skill entry {entry_name!r} rejected: skill entries require a Python reference")
         else:
-            _validate_python_skill_reference(reference)
+            _validate_python_skill_reference(reference, entry_name)
 
 
 def _validate_refinement_event(trigger: Any, changes: Any, *, evidence: Any, outcome: Any) -> None:
@@ -548,9 +555,13 @@ class HarnessState:
         if kind not in self.entries:
             raise ValueError(f"unknown harness kind {kind!r}; expected one of {_KINDS}")
 
-        # Guard before the id slug: a non-string title must fail with a clear
-        # rejection, not an AttributeError inside slug normalization.
+        # Guard before the id slug and the dict lookup: a non-string title or a
+        # non-string id (falsy ids included, which the slug fallback would
+        # silently collapse) must fail with a clear rejection, not an
+        # AttributeError inside slug normalization or a TypeError from the lookup.
         _require_text(kind, _describe_entry(id, title), "title", title)
+        if id is not None:
+            _require_text(kind, _describe_entry(id, title), "id", id)
         entry_id = id or _slug(title, kind)
         existing = self.entries[kind].get(entry_id)
         _validate_entry_shape(
@@ -669,6 +680,8 @@ class HarnessState:
         if kind not in self.entries:
             raise ValueError(f"unknown harness kind {kind!r}; expected one of {_KINDS}")
         _require_text(kind, _describe_entry(id, title), "title", title)
+        if id is not None:
+            _require_text(kind, _describe_entry(id, title), "id", id)
         entry_id = id or _slug(title, kind)
         if entry_id in self.entries[kind]:
             raise ValueError(f"{kind} entry {entry_id!r} already exists")
@@ -716,6 +729,7 @@ class HarnessState:
         self._sync_from_disk()
         if kind not in self.entries:
             raise ValueError(f"unknown harness kind {kind!r}; expected one of {_KINDS}")
+        _require_text(kind, _describe_entry(id, title), "id", id)
         if id not in self.entries[kind]:
             raise ValueError(f"{kind} entry {id!r} does not exist")
         return self._upsert(
@@ -807,7 +821,7 @@ class HarnessState:
             content,
             id=id,
             path=path,
-            reference=_validate_python_skill_reference(reference),
+            reference=_validate_python_skill_reference(reference, _describe_entry(id, title)),
             arguments=arguments,
             metadata=metadata,
             global_=global_,
@@ -830,7 +844,9 @@ class HarnessState:
         # Only validate a reference when one is supplied; omitting it preserves the
         # existing reference (see _upsert) rather than forcing every title/content-only
         # update to re-send the full Python reference.
-        validated_reference = _validate_python_skill_reference(reference) if reference is not None else None
+        validated_reference = (
+            _validate_python_skill_reference(reference, _describe_entry(id, title)) if reference is not None else None
+        )
         return self.update(
             "skill",
             id,
@@ -892,6 +908,10 @@ class HarnessState:
         self._ensure_local_writable()
         self._sync_from_disk()
         _validate_refinement_event(trigger, changes, evidence=evidence, outcome=outcome)
+        if id is not None and (not isinstance(id, str) or not id):
+            raise ValueError(
+                f"refinement event rejected: id must be a non-empty string when provided, got {_type_name(id)}"
+            )
         event_id = id or f"refine_{len(self.refinements) + 1:04d}"
         normalized_changes = [changes] if isinstance(changes, str) else list(changes)
         event = RefinementEvent(

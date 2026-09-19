@@ -431,6 +431,16 @@ describe("harness refinement", () => {
 			error: "create requires reference to be an object when provided",
 		},
 		{
+			label: "a create with a numeric path",
+			edit: editWith("create", "memory", "bad_path", { path: 7 }),
+			error: "create requires path to be a non-empty string when provided",
+		},
+		{
+			label: "a skill with list arguments",
+			edit: editWith("create", "skill", "list_arguments", { arguments: ["a"] }),
+			error: "create requires arguments to be an object when provided",
+		},
+		{
 			label: "an update with list metadata",
 			seed: "memory",
 			edit: editWith("update", "memory", "memory_entry", { metadata: ["m"] }),

@@ -469,10 +469,22 @@ export function harnessEntryMalformation(entry: HarnessEntry): string | undefine
  * outcome with string operations, so a non-string trigger or non-array changes
  * must be skipped with a diagnostic rather than crash the digest. */
 export function harnessRefinementMalformation(event: HarnessRefinementEvent): string | undefined {
+	if (typeof event !== "object" || event === null) return "event not an object";
 	if (typeof event.trigger !== "string") return "trigger not a string";
 	if (!Array.isArray(event.changes)) return "changes not an array";
 	if (event.outcome !== undefined && typeof event.outcome !== "string") return "outcome not a string";
 	return undefined;
+}
+
+/** Bounded label for a skipped malformed refinement event. Non-object elements
+ * are labeled by type, never by value: a corrupt store element must not inject
+ * arbitrary unbounded text into every session's prompt digest. */
+function malformedRefinementEventLabel(event: HarnessRefinementEvent): string {
+	if (event === null) return "null";
+	if (typeof event === "undefined") return "undefined";
+	if (typeof event !== "object") return `a ${typeof event}`;
+	if (Array.isArray(event)) return "an array";
+	return `${event.id}`;
 }
 
 function compactText(text: string, maxLength: number): string {
@@ -492,7 +504,7 @@ export function formatRefinementNoticeBody(result: RefinementResult): string {
 		const scope = entry?.scope ?? result.scope ?? "local";
 		const malformation = entry ? harnessEntryMalformation(entry) : undefined;
 		lines.push(
-			`- ${edit.action} ${edit.kind} [${scope}:${edit.id}] ${entry?.title ?? edit.id}: ${compactText(
+			`- ${edit.action} ${edit.kind} [${scope}:${edit.id}] ${malformation ? edit.id : (entry?.title ?? edit.id)}: ${compactText(
 				malformation ? "" : (entry?.content ?? ""),
 				DEFAULT_OVERVIEW_CONTENT_LIMIT,
 			)}${malformation ? ` (skipped malformed entry: ${malformation})` : ""}`,
@@ -731,7 +743,9 @@ export function formatHarnessStateForPrompt(
 	for (const event of state.refinements.slice(-maxRefinements)) {
 		const malformation = harnessRefinementMalformation(event);
 		if (malformation) {
-			lines.push(`harness: skipped malformed refinement event ${event.id} (${malformation})`);
+			lines.push(
+				`harness: skipped malformed refinement event ${malformedRefinementEventLabel(event)} (${malformation})`,
+			);
 			continue;
 		}
 		const changes = event.changes.length > 0 ? event.changes.join(", ") : "no applied edits";
@@ -754,7 +768,8 @@ export function formatHarnessStateForPrompt(
  *
  * Covered: entry identity and content (entry order is normalized away, as is
  * the call contract on non-skill entries, which the formatter never prints),
- * plus the render flags and each refinement's printed fields in stored order,
+ * plus the render flags and each refinement's printed fields in stored order
+ * (a malformed event's printed fields are its skip-line label and reason),
  * since the formatter renders a positional newest tail. The shell-examples
  * flag participates only when IPython examples are not rendered: the formatter
  * never reads it then, so it is normalized out of the fingerprint to keep an
@@ -789,12 +804,16 @@ export function harnessDigestFingerprint(
 	// Refinements keep their stored order: the formatter renders the newest
 	// tail of the array, so an order-only change renders differently and must
 	// not reuse the previous digest.
-	const refinements = state.refinements.map((event) => ({
-		id: event.id,
-		trigger: event.trigger,
-		changes: event.changes,
-		outcome: event.outcome,
-	}));
+	const refinements = state.refinements.map((event) => {
+		const malformation = harnessRefinementMalformation(event);
+		// A malformed event renders as a skip line (label + reason), not its
+		// fields, so that pair is the fingerprint material for it: fingerprint
+		// equality implies identical renders, corrupted stores included.
+		if (malformation !== undefined) {
+			return { malformed: malformation, label: malformedRefinementEventLabel(event) };
+		}
+		return { id: event.id, trigger: event.trigger, changes: event.changes, outcome: event.outcome };
+	});
 	// The formatter renders the shell call-contract only when IPython examples
 	// are absent, so the shell flag cannot change the digest while IPython
 	// examples take precedence; fingerprint only the flags the render reads.
