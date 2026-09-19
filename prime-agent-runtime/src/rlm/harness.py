@@ -214,6 +214,101 @@ def _validate_python_skill_reference(reference: dict[str, Any] | None) -> dict[s
     return normalized
 
 
+def _type_name(value: Any) -> str:
+    if isinstance(value, list):
+        return "a list"
+    if value == "":
+        return "an empty string"
+    return type(value).__name__
+
+
+def _describe_entry(id: Any, title: Any) -> str:
+    """Best available entry name for rejection messages."""
+    if isinstance(id, str) and id:
+        return id
+    if isinstance(title, str) and title:
+        return title
+    return "<unnamed>"
+
+
+def _require_text(kind: str, entry_name: str, field: str, value: Any) -> None:
+    if not isinstance(value, str) or not value:
+        raise ValueError(
+            f"{kind} entry {entry_name!r} rejected: {field} must be a non-empty string, got {_type_name(value)}"
+        )
+
+
+def _require_optional_text(kind: str, entry_name: str, field: str, value: Any) -> None:
+    if value is not None:
+        _require_text(kind, entry_name, field, value)
+
+
+def _require_optional_record(kind: str, entry_name: str, field: str, value: Any) -> None:
+    if value is not None and not isinstance(value, dict):
+        raise ValueError(
+            f"{kind} entry {entry_name!r} rejected: {field} must be a dict when provided, got {_type_name(value)}"
+        )
+
+
+def _validate_entry_shape(
+    kind: str,
+    entry_id: Any,
+    title: Any,
+    content: Any,
+    *,
+    path: Any,
+    reference: Any,
+    arguments: Any,
+    metadata: Any,
+    source: Any,
+    existing: "HarnessEntry | None",
+) -> None:
+    """Reject an invalid harness entry before anything is persisted.
+
+    Every create/update/upsert write funnels through here, so a malformed
+    entry (content as a list, title as a number) fails with an actionable
+    error naming the entry and the field instead of being saved and later
+    crashing the host digest that renders every session's system prompt.
+    """
+    entry_name = _describe_entry(entry_id, title)
+    _require_text(kind, entry_name, "id", entry_id)
+    _require_text(kind, entry_name, "title", title)
+    _require_text(kind, entry_name, "content", content)
+    _require_optional_text(kind, entry_name, "path", path)
+    _require_optional_record(kind, entry_name, "reference", reference)
+    _require_optional_record(kind, entry_name, "arguments", arguments)
+    _require_optional_record(kind, entry_name, "metadata", metadata)
+    _require_text(kind, entry_name, "source", source)
+    if kind == "skill":
+        if reference is None:
+            # A new skill without a Python reference is invalid; an update that
+            # omits it preserves the existing reference instead.
+            if existing is None:
+                raise ValueError(f"skill entry {entry_name!r} rejected: skill entries require a Python reference")
+        else:
+            _validate_python_skill_reference(reference)
+
+
+def _validate_refinement_event(trigger: Any, changes: Any, *, evidence: Any, outcome: Any) -> None:
+    """Reject a refinement event whose persisted shape would break the digest."""
+    if not isinstance(trigger, str) or not trigger:
+        raise ValueError(f"refinement event rejected: trigger must be a non-empty string, got {_type_name(trigger)}")
+    if isinstance(changes, str):
+        if not changes:
+            raise ValueError("refinement event rejected: changes must be a non-empty string or a list of strings")
+    elif isinstance(changes, list):
+        if not all(isinstance(change, str) and change for change in changes):
+            raise ValueError("refinement event rejected: changes must be a list of non-empty strings")
+    else:
+        raise ValueError(
+            f"refinement event rejected: changes must be a string or a list of strings, got {_type_name(changes)}"
+        )
+    if not isinstance(evidence, str):
+        raise ValueError(f"refinement event rejected: evidence must be a string when provided, got {_type_name(evidence)}")
+    if not isinstance(outcome, str):
+        raise ValueError(f"refinement event rejected: outcome must be a string when provided, got {_type_name(outcome)}")
+
+
 class HarnessState:
     """CRUD store for reset-free harness refinement state."""
 
@@ -453,8 +548,23 @@ class HarnessState:
         if kind not in self.entries:
             raise ValueError(f"unknown harness kind {kind!r}; expected one of {_KINDS}")
 
+        # Guard before the id slug: a non-string title must fail with a clear
+        # rejection, not an AttributeError inside slug normalization.
+        _require_text(kind, _describe_entry(id, title), "title", title)
         entry_id = id or _slug(title, kind)
         existing = self.entries[kind].get(entry_id)
+        _validate_entry_shape(
+            kind,
+            entry_id,
+            title,
+            content,
+            path=path,
+            reference=reference,
+            arguments=arguments,
+            metadata=metadata,
+            source=source,
+            existing=existing,
+        )
         if existing:
             existing.title = title
             existing.content = content
@@ -558,6 +668,7 @@ class HarnessState:
         self._sync_from_disk()
         if kind not in self.entries:
             raise ValueError(f"unknown harness kind {kind!r}; expected one of {_KINDS}")
+        _require_text(kind, _describe_entry(id, title), "title", title)
         entry_id = id or _slug(title, kind)
         if entry_id in self.entries[kind]:
             raise ValueError(f"{kind} entry {entry_id!r} already exists")
@@ -780,6 +891,7 @@ class HarnessState:
             return target.record_refinement(trigger, changes, evidence=evidence, outcome=outcome, id=id)
         self._ensure_local_writable()
         self._sync_from_disk()
+        _validate_refinement_event(trigger, changes, evidence=evidence, outcome=outcome)
         event_id = id or f"refine_{len(self.refinements) + 1:04d}"
         normalized_changes = [changes] if isinstance(changes, str) else list(changes)
         event = RefinementEvent(
