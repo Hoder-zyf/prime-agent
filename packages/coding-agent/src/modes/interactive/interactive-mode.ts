@@ -348,6 +348,9 @@ interface PendingToolCallRenderInput {
 const HEARTBEAT_LEGACY_PROMPT_MIN_TOLERANCE_MS = 15_000;
 const HEARTBEAT_LEGACY_PROMPT_MAX_TOLERANCE_MS = 120_000;
 const MODEL_CATALOG_REFRESH_TTL_MS = 60_000;
+// Status-driven top bar cost refreshes rebuild the full context tree; agent_end
+// and attach/reconnect refresh unthrottled for per-turn and per-attach convergence.
+const TOP_BAR_COST_REFRESH_MIN_INTERVAL_MS = 1_000;
 function isLabeledQueuedPreview(message: string): boolean {
 	return (
 		message.startsWith(`${HEARTBEAT_PROMPT_PREVIEW_LABEL}: `) ||
@@ -1349,7 +1352,7 @@ export class InteractiveMode {
 	/** Cached session spend (USD) for the top bar, keyed to the session it was fetched for. */
 	private topBarCost: { sessionId?: string; total?: number } = {};
 	/** Stale-discard state for top bar cost refreshes (mirrors contextUsageRefresh). */
-	private topBarCostRefresh = { generation: 0, lastSuccessGeneration: 0 };
+	private topBarCostRefresh = { generation: 0, lastSuccessGeneration: 0, lastRefreshAt: 0 };
 
 	private builtInHeader: Component | undefined = undefined;
 
@@ -1787,6 +1790,17 @@ export class InteractiveMode {
 	}
 
 	/**
+	 * Leading-edge throttled refresh for status-driven call sites; drops calls
+	 * within TOP_BAR_COST_REFRESH_MIN_INTERVAL_MS of the last refresh (direct
+	 * refreshes included — they stamp the window too).
+	 */
+	private refreshTopBarCostThrottled(): void {
+		const refresh = this.topBarCostRefresh ?? { lastRefreshAt: 0 };
+		if (Date.now() - refresh.lastRefreshAt < TOP_BAR_COST_REFRESH_MIN_INTERVAL_MS) return;
+		this.refreshTopBarCost();
+	}
+
+	/**
 	 * Refresh the top bar's cached session spend from the context tree.
 	 * Results for a replaced session, or superseded by a newer successful
 	 * refresh, are discarded — mirroring refreshConnectionContextUsage.
@@ -1795,8 +1809,9 @@ export class InteractiveMode {
 		// Partial-mode test harnesses skip the constructor, so the field
 		// initializer may be absent there; the refresh is cosmetic and must
 		// never crash a real flow on any `this`.
-		this.topBarCostRefresh ??= { generation: 0, lastSuccessGeneration: 0 };
+		this.topBarCostRefresh ??= { generation: 0, lastSuccessGeneration: 0, lastRefreshAt: 0 };
 		const refresh = this.topBarCostRefresh;
+		refresh.lastRefreshAt = Date.now();
 		const generation = ++refresh.generation;
 		const connection = this.agentConnection;
 		const sessionId = this.connectionState?.sessionId;
@@ -5699,7 +5714,7 @@ export class InteractiveMode {
 					this.sessionRecap = event.recap;
 					this.patchConnectionState({ recap: event.recap });
 					this.renderRecap();
-					this.refreshTopBarCost();
+					this.refreshTopBarCostThrottled();
 				} else if (event.type === "side_question_event") {
 					this.handleSideQuestionEvent(event.event);
 				} else if (event.type === "extension_ui_request") {
@@ -5946,7 +5961,7 @@ export class InteractiveMode {
 
 			case "session_info_changed":
 				this.updateTerminalTitle();
-				this.refreshTopBarCost();
+				this.refreshTopBarCostThrottled();
 				this.footer.invalidate();
 				this.ui.requestRender();
 				break;

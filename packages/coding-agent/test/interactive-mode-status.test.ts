@@ -552,6 +552,44 @@ describe("InteractiveMode connection events", () => {
 
 		expect(calls).toEqual(["replacement", "reset", "messages", "display", "loader"]);
 	});
+
+	test("throttles session_status top bar refreshes to one per second; direct refreshes reset the window", async () => {
+		vi.useFakeTimers();
+		try {
+			const { fakeThis, emit } = createSubscribeHarness({
+				patchConnectionState: vi.fn(),
+				renderRecap: vi.fn(),
+				isInitialized: true,
+				footer: { invalidate: vi.fn() },
+				activityTracker: { handleEvent: vi.fn() },
+				updateWorkingLoaderMessage: vi.fn(),
+				updateTerminalTitle: vi.fn(),
+			});
+			Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
+			const getContextTree = vi.fn(async () => ({ totalUsage: { cost: { total: 5 } } }));
+			fakeThis.agentConnection.getContextTree = getContextTree;
+
+			await emit({ type: "session_status", recap: "working" });
+			expect(getContextTree).toHaveBeenCalledOnce();
+			await emit({ type: "session_status", recap: "still working" });
+			expect(getContextTree).toHaveBeenCalledOnce();
+			// session_info_changed routes the same throttled refresh through handleEvent's switch.
+			const handleEvent = (InteractiveMode.prototype as unknown as {
+				handleEvent(this: unknown, event: unknown): Promise<void>;
+			}).handleEvent;
+			await handleEvent.call(fakeThis, { type: "session_info_changed" });
+			expect(getContextTree).toHaveBeenCalledOnce();
+			vi.advanceTimersByTime(1_100);
+			await emit({ type: "session_status", recap: "done" });
+			expect(getContextTree).toHaveBeenCalledTimes(2);
+			(InteractiveMode.prototype as unknown as { refreshTopBarCost(this: unknown): void }).refreshTopBarCost.call(fakeThis);
+			expect(getContextTree).toHaveBeenCalledTimes(3);
+			await emit({ type: "session_status", recap: "again" });
+			expect(getContextTree).toHaveBeenCalledTimes(3);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
 });
 
 describe("InteractiveMode connection extension UI", () => {

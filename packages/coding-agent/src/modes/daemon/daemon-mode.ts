@@ -623,6 +623,13 @@ export class AgentDaemon {
 		snapshotPending: false,
 	};
 	private rosterFlushScheduled = false;
+	private rosterFlushTimer?: ReturnType<typeof setTimeout>;
+	/** Last scheduled flush time (Date.now()); gates the flush coalescing window. */
+	private rosterLastFlushAt?: number;
+	/** Sessions a roster-event trigger marked dirty for the next flush. */
+	private readonly rosterDirtyAgentIds = new Set<string>();
+	/** Lifecycle/mutation triggers set this: the next flush recomposes everything. */
+	private rosterFlushFull = false;
 	private rosterHeartbeatTimer?: ReturnType<typeof setInterval>;
 	private rlmSpawnLedgerInstance?: RlmSpawnLedger;
 	/** In-flight admission spawn appends, awaited (and consumed) by createRlmSubagentRuntime. */
@@ -7300,7 +7307,7 @@ export class AgentDaemon {
 		) {
 			return;
 		}
-		this.scheduleRosterFlush();
+		this.scheduleRosterFlush(state);
 	}
 
 	private observeRosterChildUpdate(state: ActiveSessionState, child: AgentConnectionRlmChildAgentSnapshot): void {
@@ -7311,7 +7318,7 @@ export class AgentDaemon {
 		} else {
 			this.rosterReporter.queuedChildren.delete(entry.agentId);
 		}
-		this.scheduleRosterFlush();
+		this.scheduleRosterFlush(state);
 	}
 
 	private hasSessionForRlmChild(parentState: ActiveSessionState, childId: string): boolean {
@@ -7352,17 +7359,44 @@ export class AgentDaemon {
 		return { agentId: rosterAgentIdForSummary(summary), queuedChild: true, summary };
 	}
 
-	private scheduleRosterFlush(): void {
-		if (!this.options.worker || this.rosterFlushScheduled || this.shuttingDown) return;
-		this.rosterFlushScheduled = true;
-		setImmediate(() => {
-			this.rosterFlushScheduled = false;
-			try {
-				this.flushRoster();
-			} catch (error) {
-				this.log(`could not publish roster delta: ${String(error)}`);
-			}
-		});
+	// Session-scoped triggers (roster events, child updates) mark only their
+	// session dirty; every other caller mutates state that can affect any
+	// session, so those schedule a full recompose.
+	private scheduleRosterFlush(state?: ActiveSessionState): void {
+		if (!this.options.worker || this.shuttingDown) return;
+		if (state === undefined) {
+			this.rosterFlushFull = true;
+		} else {
+			this.rosterDirtyAgentIds.add(this.rosterAgentIdForState(state));
+		}
+		if (this.rosterFlushScheduled || this.rosterFlushTimer !== undefined) return;
+		if (this.rosterLastFlushAt === undefined || Date.now() - this.rosterLastFlushAt >= ROSTER_FLUSH_MIN_INTERVAL_MS) {
+			this.rosterFlushScheduled = true;
+			setImmediate(() => {
+				this.rosterFlushScheduled = false;
+				this.runScheduledRosterFlush();
+			});
+			return;
+		}
+		this.rosterFlushTimer = setTimeout(
+			() => {
+				this.rosterFlushTimer = undefined;
+				this.runScheduledRosterFlush();
+			},
+			// Clamp the elapsed at zero: a backwards wall-clock step (negative
+			// elapsed) must not arm an over-long window.
+			ROSTER_FLUSH_MIN_INTERVAL_MS - Math.max(0, Date.now() - this.rosterLastFlushAt),
+		);
+		this.rosterFlushTimer.unref?.();
+	}
+
+	private runScheduledRosterFlush(): void {
+		this.rosterLastFlushAt = Date.now();
+		try {
+			this.flushRoster();
+		} catch (error) {
+			this.log(`could not publish roster delta: ${String(error)}`);
+		}
 	}
 
 	private flushRoster(): void {
@@ -7373,18 +7407,52 @@ export class AgentDaemon {
 		// be reused instead of re-composed and re-stringified on every flush.
 		const composedSources = new Map<string, SessionSummary>();
 		const scheduledJobs = this.cronStore.list();
-		for (const summary of buildSessionList([...this.sessions.values()], [], scheduledJobs)) {
-			const agentId = rosterAgentIdForSummary(summary);
-			if (reporter.lastComposedSource.get(agentId) === summary) {
-				const entry = reporter.lastComposed.get(agentId);
-				if (entry) {
-					entries.set(agentId, entry);
-					composedSources.set(agentId, summary);
-					continue;
-				}
+		// Compose only what a trigger marked dirty (plus sessions never composed
+		// and rows whose previous entry is passivated); untouched sessions reuse
+		// their previous entry + composed source. Composing is the fingerprint
+		// walk, so skipping untouched sessions is the per-flush cost win. A flush
+		// with no marks recomposes everything: untracked callers exist.
+		const fullFlush = this.rosterFlushFull || this.rosterDirtyAgentIds.size === 0;
+		this.rosterFlushFull = false;
+		const dirtyAgentIds = new Set(this.rosterDirtyAgentIds);
+		this.rosterDirtyAgentIds.clear();
+		const targetStates: ActiveSessionState[] = [];
+		for (const state of this.sessions.values()) {
+			if (fullFlush) {
+				targetStates.push(state);
+				continue;
 			}
-			entries.set(agentId, workerRosterEntryFromSummary(summary));
-			composedSources.set(agentId, summary);
+			const agentId = this.rosterAgentIdForState(state);
+			const previous = reporter.lastComposed.get(agentId);
+			if (dirtyAgentIds.has(agentId) || previous === undefined || previous.summary.activeSessionId === undefined) {
+				targetStates.push(state);
+			}
+		}
+		const composedSummaries = new Map<string, SessionSummary>();
+		for (const summary of buildSessionList(targetStates, [], scheduledJobs)) {
+			composedSummaries.set(rosterAgentIdForSummary(summary), summary);
+		}
+		for (const state of this.sessions.values()) {
+			const agentId = this.rosterAgentIdForState(state);
+			const summary = composedSummaries.get(agentId);
+			if (summary !== undefined) {
+				if (reporter.lastComposedSource.get(agentId) === summary) {
+					const entry = reporter.lastComposed.get(agentId);
+					if (entry) {
+						entries.set(agentId, entry);
+						composedSources.set(agentId, summary);
+						continue;
+					}
+				}
+				entries.set(agentId, workerRosterEntryFromSummary(summary));
+				composedSources.set(agentId, summary);
+				continue;
+			}
+			const previous = reporter.lastComposed.get(agentId);
+			if (previous === undefined) continue;
+			entries.set(agentId, previous);
+			const previousSource = reporter.lastComposedSource.get(agentId);
+			if (previousSource !== undefined) composedSources.set(agentId, previousSource);
 		}
 		for (const [agentId, queued] of reporter.queuedChildren) {
 			if (entries.has(agentId)) {
@@ -7903,6 +7971,10 @@ export class AgentDaemon {
 			clearInterval(this.rosterHeartbeatTimer);
 			this.rosterHeartbeatTimer = undefined;
 		}
+		if (this.rosterFlushTimer) {
+			clearTimeout(this.rosterFlushTimer);
+			this.rosterFlushTimer = undefined;
+		}
 		this.log(`shutting down (exit ${exitCode}); closing ${this.sessions.size} active session(s)`);
 		const closingReason = this.getShutdownClosingReason();
 		for (const client of this.clients) {
@@ -7961,6 +8033,10 @@ const ROSTER_SESSION_EVENT_TRIGGERS = new Set([
 	"session_info_changed",
 	"thinking_level_changed",
 ]);
+
+// Flushes coalesce into one window: streaming bursts fire several triggers per
+// turn, and a flush composes fingerprints for its target sessions.
+const ROSTER_FLUSH_MIN_INTERVAL_MS = 250;
 
 /**
  * The transfer id must name the cursor observed at materialization, not the live session cursor:

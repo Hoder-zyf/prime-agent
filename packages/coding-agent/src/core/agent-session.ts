@@ -1061,6 +1061,12 @@ interface RlmChildRun {
 	reportDeletionCleanupFailure?: (error: unknown) => Promise<void>;
 	emitUpdate?: () => void;
 	lastEmittedUpdate?: string;
+	/**
+	 * Monotonic time of the last streamed-delta emit (performance.now()). The
+	 * message_update/message_start branch throttles snapshot+emit work to
+	 * RLM_CHILD_UPDATE_MIN_INTERVAL_MS; other event kinds still emit at once.
+	 */
+	lastStreamedUpdateMonotonicAt?: number;
 	unsubscribe?: () => void;
 }
 
@@ -1077,6 +1083,8 @@ const KERNEL_STATE_LISTING_TIMEOUT_MS = 5000;
 const RLM_MAX_DEPTH_STATE_CUSTOM_TYPE = "rlm_max_depth_state";
 /** Minimum spacing between accepted progress notes from one child session. */
 const RLM_PROGRESS_NOTE_MIN_INTERVAL_MS = 10_000;
+/** Minimum spacing between streamed-delta child update emits per child run. */
+export const RLM_CHILD_UPDATE_MIN_INTERVAL_MS = 1_000;
 /** Bounded ring of progress notes kept per child run; the snapshot exposes the newest. */
 const RLM_CHILD_PROGRESS_NOTE_RING_MAX = 5;
 /** A running child with no tracked activity for this long reports activityStaleMs. */
@@ -1314,6 +1322,24 @@ function readAssistantText(message: AssistantMessage): string {
 		.filter((block) => block.type === "text")
 		.map((block) => block.text)
 		.join("");
+}
+
+// Trailing window feeding the streaming answer preview: message_update fires
+// per token delta, so rejoining (and re-collapsing) the whole message costs
+// O(length) per delta, O(length²) per streamed child message. The window keeps
+// each delta O(window); the preview shows the latest output, not the head.
+const RLM_ANSWER_PREVIEW_TAIL_CHARS = 200;
+
+function tailRlmAnswerPreview(message: AssistantMessage): string {
+	const tail: string[] = [];
+	let collected = 0;
+	for (let index = message.content.length - 1; index >= 0 && collected < RLM_ANSWER_PREVIEW_TAIL_CHARS; index -= 1) {
+		const block = message.content[index];
+		if (block.type !== "text") continue;
+		tail.unshift(block.text);
+		collected += block.text.length;
+	}
+	return compactRlmText(tail.join("").slice(-RLM_ANSWER_PREVIEW_TAIL_CHARS));
 }
 
 function waitForPromiseOrAbort<T>(
@@ -12227,17 +12253,26 @@ export class AgentSession {
 								pendingChildUsage.set(origin, bucket);
 							}
 						}
-						const text = compactRlmText(readAssistantText(assistant));
+						const text = tailRlmAnswerPreview(assistant);
 						if (text) run.answerPreview = text;
 						touchRlmChildActivity(run);
 						emitChildUpdate();
 					} else if (event.type === "message_start" || event.type === "message_update") {
 						if (event.message.role === "assistant") {
-							const text = compactRlmText(readAssistantText(event.message as AssistantMessage));
+							const text = tailRlmAnswerPreview(event.message as AssistantMessage);
 							if (text) run.answerPreview = text;
 							run.activity = { kind: "writing" };
 							touchRlmChildActivity(run);
-							emitChildUpdate();
+							// Snapshot+stringify per delta dominates streaming cost; message_end
+							// still emits the final preview, so cap the per-delta path.
+							const now = performance.now();
+							if (
+								run.lastStreamedUpdateMonotonicAt === undefined ||
+								now - run.lastStreamedUpdateMonotonicAt >= RLM_CHILD_UPDATE_MIN_INTERVAL_MS
+							) {
+								run.lastStreamedUpdateMonotonicAt = now;
+								emitChildUpdate();
+							}
 						}
 					} else if (event.type === "tool_execution_start") {
 						flushPendingChildUsageIfStale();
