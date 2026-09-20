@@ -2566,13 +2566,22 @@ export class AgentSession {
 
 	/**
 	 * Whether a dispatched turn is still in flight: streaming, retrying with
-	 * backoff, or compacting before a continuation. Model selection during
-	 * any of these must not tear down a routed run's override, or the run's
+	 * backoff, compacting before a continuation, an overflow recovery or
+	 * provider wait still settling, or a post-compaction continuation that
+	 * has been scheduled but not yet dispatched. Model selection during any
+	 * of these must not tear down a routed run's override, or the run's
 	 * retries, continuations, and failure attribution would leave the
 	 * image-capable model mid-turn.
 	 */
 	private get _hasActiveTurnLifecycle(): boolean {
-		return this.isStreaming || this.isRetrying || this.isCompacting;
+		return (
+			this.isStreaming ||
+			this.isRetrying ||
+			this.isCompacting ||
+			this._postCompactionContinuationScheduled ||
+			this._overflowRecovery !== "idle" ||
+			this._providerWait !== undefined
+		);
 	}
 
 	/**
