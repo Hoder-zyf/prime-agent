@@ -465,26 +465,29 @@ export function harnessEntryMalformation(entry: HarnessEntry): string | undefine
 	return undefined;
 }
 
-/** Same contract for refinement events: the digest renders trigger, changes, and
- * outcome with string operations, so a non-string trigger or non-array changes
- * must be skipped with a diagnostic rather than crash the digest. */
+/** Same contract for refinement events: the digest renders id, trigger, changes,
+ * and outcome with string operations, so a non-string id or trigger, non-array
+ * changes, non-string change elements, or non-string outcome must be skipped
+ * with a diagnostic rather than crash the digest or render junk. */
 export function harnessRefinementMalformation(event: HarnessRefinementEvent): string | undefined {
 	if (typeof event !== "object" || event === null) return "event not an object";
+	if (typeof event.id !== "string") return "id not a string";
 	if (typeof event.trigger !== "string") return "trigger not a string";
 	if (!Array.isArray(event.changes)) return "changes not an array";
+	if (!event.changes.every((change) => typeof change === "string")) return "changes contain a non-string";
 	if (event.outcome !== undefined && typeof event.outcome !== "string") return "outcome not a string";
 	return undefined;
 }
 
 /** Bounded label for a skipped malformed refinement event. Non-object elements
- * are labeled by type, never by value: a corrupt store element must not inject
- * arbitrary unbounded text into every session's prompt digest. */
+ * and invalid ids are labeled by type, never by value: a corrupt store element
+ * must not inject arbitrary unbounded text into every session's prompt digest. */
 function malformedRefinementEventLabel(event: HarnessRefinementEvent): string {
 	if (event === null) return "null";
 	if (typeof event === "undefined") return "undefined";
 	if (typeof event !== "object") return `a ${typeof event}`;
 	if (Array.isArray(event)) return "an array";
-	return `${event.id}`;
+	return typeof event.id === "string" ? event.id : `a ${typeof event.id} id`;
 }
 
 function compactText(text: string, maxLength: number): string {
