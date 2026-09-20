@@ -818,6 +818,29 @@ def _snapshot_state(
     return result
 
 
+def _revive_with_live_globals(value: Any, ns: dict[str, Any]) -> Any:
+    """Rebind dill's by-value function revivals onto the live namespace.
+
+    dill re-creates a saved __main__ function with a private __globals__ dict
+    frozen at snapshot time, so the revived callable keeps reading stale values
+    after later cells rewrite the namespace. Rebuilding it against ns replaces
+    only __globals__ and keeps the rest of dill's revival fidelity: docstring,
+    keyword-only defaults, annotations, qualname, module, attribute dict.
+    Everything dill revived by reference (imported functions, classes, partials)
+    passes through untouched, keeping its own module's globals.
+    """
+    if not isinstance(value, types.FunctionType) or value.__module__ != "__main__":
+        return value
+    rebound = types.FunctionType(value.__code__, ns, value.__name__, value.__defaults__, value.__closure__)
+    rebound.__doc__ = value.__doc__
+    rebound.__kwdefaults__ = value.__kwdefaults__
+    rebound.__dict__.update(value.__dict__)
+    rebound.__annotations__ = value.__annotations__
+    rebound.__qualname__ = value.__qualname__
+    rebound.__module__ = value.__module__
+    return rebound
+
+
 def _restore_state(
     ns: dict[str, Any], path: str, committed: list[dict[str, Any]] | None = None
 ) -> dict[str, Any]:
@@ -849,7 +872,7 @@ def _restore_state(
     previous = signal.signal(signal.SIGINT, lambda signum, frame: None)
     try:
         for name, value in staged.items():
-            ns[name] = value
+            ns[name] = _revive_with_live_globals(value, ns)
         # Publish while still parked: a later KeyboardInterrupt into this task finds the committed result (see _handle_state).
         if committed is not None:
             committed.append(result)

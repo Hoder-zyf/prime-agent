@@ -660,6 +660,18 @@ class ReplTest(unittest.TestCase):
             events = self.repl.execute("chk", "'In' in dir()")
             self.assertEqual(one(events, "result")["text"], "False")
 
+    def test_restore_revives_functions_with_live_globals(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "state.dill")
+            self.repl.execute("fn1", "G = 1\ndef reader():\n    return G\ndef prober():\n    return late")
+            self.repl.send({"type": "snapshot", "id": "fn2", "path": path, "manifest_path": os.path.join(tmp, "state.json")})
+            self.repl.send({"type": "restore", "id": "fn3", "path": path})
+            self.assertEqual(one(self.repl.until_done("fn3"), "done")["status"], "ok")
+            events = self.repl.execute("fn4", "G = 2\nreader()")
+            self.assertEqual(one(events, "result")["text"], "2")
+            events = self.repl.execute("fn5", "late = 'live'\nprober()")
+            self.assertEqual(one(events, "result")["text"], "'live'")
+
     def test_snapshot_prune_oversized(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "kernel-state.dill")
