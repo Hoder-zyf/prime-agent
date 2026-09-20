@@ -139,7 +139,7 @@ function nextRequestSeq(llmMessages: object): number {
 }
 
 /** Provider request identity fields shared by every phase entry. */
-export interface RequestTimingRequestInfo {
+interface RequestTimingRequestInfo {
 	model: string;
 	provider?: string;
 	api?: string;
@@ -151,7 +151,7 @@ export interface RequestTimingRequestInfo {
  * seam; phase transitions are logged as they happen so a hung request shows
  * the last completed phase in the live log.
  */
-export class RequestTiming {
+class RequestTiming {
 	readonly requestSeq: number;
 	private readonly info: RequestTimingRequestInfo;
 	private readonly dispatchedAt: number | undefined;
@@ -306,14 +306,16 @@ const FIRST_TOKEN_EVENT_TYPES = new Set([
 	"toolcall_delta",
 ]);
 
-export function isRequestTimingFirstTokenEvent(type: string): boolean {
+function isRequestTimingFirstTokenEvent(type: string): boolean {
 	return FIRST_TOKEN_EVENT_TYPES.has(type);
 }
 
 /** Serialized request body size; providers serialize for the wire anyway, but only measure when timing is on. */
 function measureRequestBytes(payload: unknown): number | undefined {
 	try {
-		return JSON.stringify(payload)?.length;
+		const serialized = JSON.stringify(payload);
+		// UTF-8 bytes as sent on the wire; .length would count UTF-16 code units and underreport non-ASCII prompts.
+		return serialized === undefined ? undefined : Buffer.byteLength(serialized, "utf-8");
 	} catch {
 		return undefined;
 	}
@@ -378,7 +380,7 @@ function takePromptBuild(llmMessages: object[]): PromptBuildTiming | undefined {
  * first-content-token, and the terminal event are timed. The summary is
  * emitted on the terminal event, or as aborted when iteration stops early.
  */
-export function wrapRequestTimingEventStream(
+function wrapRequestTimingEventStream(
 	stream: AssistantMessageEventStream,
 	timing: RequestTiming,
 	signal?: AbortSignal,

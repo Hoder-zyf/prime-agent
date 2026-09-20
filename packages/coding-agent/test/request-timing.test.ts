@@ -34,7 +34,7 @@ const model = {
 	maxTokens: 128_000,
 	cost: { input: 1, output: 2, cacheRead: 0.1, cacheWrite: 1.2 },
 } as unknown as Model<"openai-completions">;
-const PAYLOAD = { messages: [{ role: "user", content: "hello" }] };
+const PAYLOAD = { messages: [{ role: "user", content: "hello \u{1F680}" }] };
 
 function finalMessage(): AssistantMessage {
 	return {
@@ -150,7 +150,7 @@ describe("request timing", () => {
 		expect(timing.at(-1)).toMatchObject({
 			outcome: "done",
 			contextEntries: 1,
-			requestBytes: JSON.stringify(PAYLOAD).length,
+			requestBytes: Buffer.byteLength(JSON.stringify(PAYLOAD)),
 			usage: { input: 800_000, output: 12, cacheRead: 790_000, cacheWrite: 0 },
 			phases: {
 				dispatchToPromptBuiltMs: 0,
@@ -189,7 +189,7 @@ describe("request timing", () => {
 		expect(probes).toHaveLength(1);
 		const enabled = timingEntries();
 		expect(enabled.find((entry) => entry.phase === "request-sent")!.requestBytes).toBeUndefined();
-		expect(enabled.at(-1)!.requestBytes).toBe(JSON.stringify(PAYLOAD).length);
+		expect(enabled.at(-1)!.requestBytes).toBe(Buffer.byteLength(JSON.stringify(PAYLOAD)));
 	});
 
 	it("reports provider failures as failed instead of losing the timeline", async () => {

@@ -82,7 +82,7 @@ Phases per request, in order. Each entry carries the gap it closed (`phaseMs`) a
 |-------|---------|----------------------|
 | `prompt-built` | Turn dispatched, prompt message array built | Client-side prompt build is slow |
 | `request-sent` | Payload handed to the provider client | Client-side request build (auth, params, extension payload hooks) is slow |
-| `first-byte` | HTTP response headers received (approximate body size in `requestBytes`) | Upload of the request body plus provider TTFB (prefill, prompt-cache miss, queueing) |
+| `first-byte` | HTTP response headers received (`requestBytes`: serialized request body size in UTF-8 bytes) | Upload of the request body plus provider TTFB (prefill, prompt-cache miss, queueing) |
 | `first-token` | First streamed content block (what clears `Waiting`) | Stream parse delay; usually near zero |
 | `stream-done` | Terminal event, with the summary below | Slow full stream |
 
