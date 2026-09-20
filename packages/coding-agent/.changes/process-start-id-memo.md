@@ -1,0 +1,1 @@
+- Memoized process start ids per pid: repeated identity checks (session leases, orphan journal, supervisor ownership) no longer re-exec `ps` for the same pid, and dead pids resolve without a subprocess query at all.

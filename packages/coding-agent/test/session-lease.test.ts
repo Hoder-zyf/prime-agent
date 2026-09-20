@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	acquireSessionLease,
 	canonicalSessionPath,
+	getProcessStartId,
 	getWindowsProcessStartId,
 	isRenameTargetContention,
 	SESSION_LEASE_OWNER_ID_ENV,
@@ -68,6 +69,36 @@ describe("session leases", () => {
 		expect(getWindowsProcessStartId(42, query)).toBeUndefined();
 		expect(getWindowsProcessStartId(0, query)).toBeUndefined();
 		expect(queryCount).toBe(1);
+	});
+
+	describe("process start id memoization", () => {
+		// Pid above every realistic pid_max keeps the shared memo from leaking across tests.
+		it("memoizes per pid, drops on death, and re-queries on pid reuse", () => {
+			let calls = 0;
+			const query = () => {
+				calls++;
+				return `Mon Jun  9 10:0${calls}:00 2025`;
+			};
+			const alive = () => true;
+			const memoPid = 4_194_300;
+
+			const first = getProcessStartId(memoPid, query, alive, "darwin");
+			const memoHit = getProcessStartId(memoPid, query, alive, "darwin");
+			expect(first).toBe("ps:Mon Jun  9 10:01:00 2025");
+			expect(memoHit).toBe(first);
+			expect(getProcessStartId(0, query, alive, "darwin")).toBeUndefined();
+			expect(getProcessStartId(-1, query, alive, "darwin")).toBeUndefined();
+			expect(calls).toBe(1);
+
+			// A dead pid resolves like a failed query, without paying one.
+			expect(getProcessStartId(memoPid, query, () => false, "darwin")).toBeUndefined();
+			expect(calls).toBe(1);
+
+			// The dropped entry re-queries: a reused pid reports its new identity.
+			expect(getProcessStartId(memoPid, query, alive, "darwin")).toBe("ps:Mon Jun  9 10:02:00 2025");
+			expect(getProcessStartId(memoPid, query, alive, "darwin")).toBe("ps:Mon Jun  9 10:02:00 2025");
+			expect(calls).toBe(2);
+		});
 	});
 
 	it("rejects a second live owner with a typed active-session error", () => {

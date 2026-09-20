@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { lockSync } from "proper-lockfile";
-import { execFileSyncHidden, isProcessAlive } from "../utils/child-process.js";
+import { execFileSyncHidden, isProcessAlive, processIdExists } from "../utils/child-process.js";
 
 export const SESSION_LEASES_ENABLED_ENV = "PRIME_AGENT_INTERNAL_SESSION_LEASES";
 export const SESSION_LEASE_OWNER_ID_ENV = "PRIME_AGENT_INTERNAL_SESSION_LEASE_OWNER_ID";
@@ -159,13 +159,44 @@ export function getPsProcessStartId(pid: number, query: ProcessQuery = runProces
 	}
 }
 
-export function getProcessStartId(pid: number): string | undefined {
+/**
+ * Start ids cannot change while a process lives, so they are memoized per pid:
+ * repeated identity checks stop re-executing `ps` for the same pid. An entry
+ * drops as soon as its pid stops existing (a kill(0) probe, no subprocess) -
+ * the earliest moment a pid can begin reuse - so a reused pid re-queries and
+ * records the new process's identity.
+ */
+const startIdByPid = new Map<number, string>();
+
+export function getProcessStartId(
+	pid: number,
+	query: ProcessQuery = runProcessQuery,
+	pidExists: (pid: number) => boolean = processIdExists,
+	platform: NodeJS.Platform = process.platform,
+): string | undefined {
 	if (!Number.isInteger(pid) || pid <= 0) {
 		return undefined;
 	}
-	if (process.platform === "win32") {
-		return getWindowsProcessStartId(pid);
+	const memoized = startIdByPid.get(pid);
+	if (memoized !== undefined) {
+		if (pidExists(pid)) {
+			return memoized;
+		}
+		startIdByPid.delete(pid);
+		return undefined;
 	}
+	if (!pidExists(pid)) {
+		// No process holds the pid; a start-id query would fail the same way.
+		return undefined;
+	}
+	const startId = platform === "win32" ? getWindowsProcessStartId(pid, query) : readPosixProcessStartId(pid, query);
+	if (startId !== undefined) {
+		startIdByPid.set(pid, startId);
+	}
+	return startId;
+}
+
+function readPosixProcessStartId(pid: number, query: ProcessQuery): string | undefined {
 	try {
 		const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
 		const commandEnd = stat.lastIndexOf(")");
@@ -177,7 +208,7 @@ export function getProcessStartId(pid: number): string | undefined {
 	} catch {
 		// Fall through to the portable process listing used on macOS and BSD.
 	}
-	return getPsProcessStartId(pid);
+	return getPsProcessStartId(pid, query);
 }
 
 let currentProcessStartId: string | undefined;
