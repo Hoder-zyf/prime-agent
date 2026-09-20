@@ -2579,9 +2579,16 @@ export class AgentSession {
 			this.isRetrying ||
 			this.isCompacting ||
 			this._postCompactionContinuationScheduled ||
-			this._overflowRecovery !== "idle" ||
-			this._providerWait !== undefined
+			// Covers the whole submission-to-settled window: preflight (before the
+			// action enqueues), the queued turn, and any in-flight run - without
+			// latching on stale overflow-recovery state.
+			this._promptSubmissionInFlight ||
+			this._hasPendingOrRunningTurnAction
 		);
+	}
+
+	private get _hasPendingOrRunningTurnAction(): boolean {
+		return this._actionStore.unfinishedActions().some((action) => action.payload.kind === "turn");
 	}
 
 	/**
@@ -5731,7 +5738,21 @@ export class AgentSession {
 		}
 	}
 
+	private _promptSubmissionInFlight = false;
+
 	private async _prompt(text: string, options?: InternalPromptOptions): Promise<void> {
+		// Synchronous preflight guard: from submission until the prompt promise
+		// settles, a model switch must not tear down a routed turn's override
+		// (the routing decision for this turn's images may already be made).
+		this._promptSubmissionInFlight = true;
+		try {
+			return await this._promptInner(text, options);
+		} finally {
+			this._promptSubmissionInFlight = false;
+		}
+	}
+
+	private async _promptInner(text: string, options?: InternalPromptOptions): Promise<void> {
 		const resumeSuspendedInput = options?.resumeIfIdle !== false;
 		if (!this.isStreaming) {
 			if (resumeSuspendedInput) this._resumeSessionInputAdmission();
