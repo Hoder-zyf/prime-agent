@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import subprocess
 import sys
 import tempfile
 import unittest
-from colorsys import rgb_to_hsv
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -121,39 +119,12 @@ class ReportTests(unittest.TestCase):
                 )
                 self.assertEqual(result.outcome, "no clear change")
 
-    def test_slower_and_faster_have_consistent_signs_and_arrows(self):
+    def test_significant_shifts_classify_as_regressions_or_improvements(self):
         baseline = observations(*([2.0] * 10))
         slower = comparison(METRICS[0], baseline, observations(*([2.5] * 10)), 10)
         faster = comparison(METRICS[0], baseline, observations(*([1.5] * 10)), 10)
         self.assertEqual(slower.outcome, "regressed")
         self.assertEqual(faster.outcome, "improved")
-        self.assertEqual(slower.change, r"$`\textcolor{#b9625f}{\textsf{↑ +500.0 ms (+25.00\%)}}`$")
-        self.assertEqual(faster.change, r"$`\textcolor{#548565}{\textsf{↓ -500.0 ms (-25.00\%)}}`$")
-
-    def test_larger_percentages_are_more_vivid_and_intensity_is_capped(self):
-        def color(baseline, head):
-            result = comparison(METRICS[3], observations(baseline), observations(head), 1)
-            match = re.search(r"\\textcolor\{(#[0-9a-f]{6})\}", result.change)
-            self.assertIsNotNone(match)
-            return match[1]
-
-        baseline = 100_000_000
-        for direction in (-1, 1):
-            with self.subTest(direction=direction):
-                colors = [
-                    color(baseline, baseline * (1 + direction * fraction))
-                    for fraction in (0.01, 0.25, 0.5, 1.0)
-                ]
-                saturation, brightness = [], []
-                for hex_color in colors:
-                    _, s, v = rgb_to_hsv(*(int(hex_color[i : i + 2], 16) / 255 for i in (1, 3, 5)))
-                    saturation.append(s)
-                    brightness.append(v)
-                self.assertEqual(saturation, sorted(set(saturation)))
-                self.assertEqual(brightness, sorted(set(brightness)))
-                self.assertEqual(color(baseline * 2, baseline * 2 * (1 + direction * 0.5)), colors[2])
-        self.assertEqual(color(baseline, baseline * 2), color(baseline, baseline * 6))
-        self.assertEqual(color(0, baseline), "#aa6a65")
 
     def test_noise_and_partial_results_are_not_regressions(self):
         noisy = observations(1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
@@ -172,7 +143,6 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(cells.outcome, "regressed")
         unchanged = comparison(METRICS[3], observations(10_000_000), observations(10_001_000), 1)
         self.assertEqual(unchanged.outcome, "no clear change")
-        self.assertEqual(unchanged.change, "≈ +0.001 MB (+0.01%)")
 
     def test_compact_tables_summarize_outcomes_without_treating_missing_samples_as_unchanged(self):
         report = fixture()

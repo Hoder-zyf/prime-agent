@@ -227,11 +227,14 @@ def number(value: float, definition: Definition, signed: bool = False) -> str:
     return f"{scaled:+,.{precision}f}" if signed else f"{scaled:,.{precision}f}"
 
 
-def change_color(relative_change: float | None, regressed: bool) -> str:
-    muted, vivid = ((170, 106, 101), (229, 72, 77)) if regressed else ((102, 129, 109), (31, 146, 78))
-    intensity = min(abs(relative_change), 1.0) if relative_change is not None else 0.0
-    channels = (round(start + (end - start) * intensity) for start, end in zip(muted, vivid, strict=True))
-    return "#" + "".join(f"{channel:02x}" for channel in channels)
+IMPROVED_TEXT, IMPROVED_BACKGROUND = "#1f924e", "#dafbe1"
+REGRESSED_TEXT, REGRESSED_BACKGROUND = "#e5484d", "#ffebe9"
+
+
+def change_colors(regressed: bool) -> tuple[str, str]:
+    if regressed:
+        return REGRESSED_TEXT, REGRESSED_BACKGROUND
+    return IMPROVED_TEXT, IMPROVED_BACKGROUND
 
 
 def comparison(
@@ -254,9 +257,9 @@ def comparison(
     if abs(delta) <= threshold:
         return Comparison(main_text, head_text, f"≈ {change}", "no clear change")
     signal = "↑" if delta > 0 else "↓"
-    color = change_color(relative_change, regressed=delta > 0)
+    color, background = change_colors(regressed=delta > 0)
     text = f"{signal} {change}".replace("%", r"\%")
-    colored = rf"$`\textcolor{{{color}}}{{\textsf{{{text}}}}}`$"
+    colored = rf"$`\colorbox{{{background}}}{{\textcolor{{{color}}}{{\textsf{{{text}}}}}}}`$"
     return Comparison(main_text, head_text, colored, "regressed" if delta > 0 else "improved")
 
 
