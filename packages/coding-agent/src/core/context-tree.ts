@@ -1,10 +1,10 @@
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 import type { AssistantMessage, Usage } from "@earendil-works/pi-ai";
 import type { RlmChildAgentStatus } from "./agent-session.js";
 import { calculateContextTokens, estimateContextTokens } from "./compaction/index.js";
 import type { ContextUsage } from "./extensions/index.js";
-import { buildSessionContext, type FileEntry, loadEntriesFromFile, type SessionEntry } from "./session-manager.js";
+import { buildSessionContext, type FileEntry, loadEntriesFromBuffer, type SessionEntry } from "./session-manager.js";
 import { addAssistantUsage, cloneUsage, emptyUsage, subtractAssistantUsage } from "./usage.js";
 
 /** Resolves a model's context window so disk-only nodes can report utilization. */
@@ -148,8 +148,27 @@ function computeContextUsageFromEntries(
 	return { tokens: estimate.tokens, contextWindow, percent: (estimate.tokens / contextWindow) * 100 };
 }
 
-function sessionEntriesFromFile(file: string): SessionEntry[] {
-	return loadEntriesFromFile(file).filter((entry: FileEntry): entry is SessionEntry => entry.type !== "session");
+/**
+ * Read and parse a session file, returning the parsed entries plus the byte
+ * count actually read. The byte count lets the child-node cache verify the
+ * read was a complete snapshot before reusing it: an append racing the read
+ * changes the file's size. A file that vanished mid-build reports no entries,
+ * like an empty file.
+ */
+function readSessionFile(file: string): { entries: SessionEntry[]; bytes: number } | undefined {
+	let buffer: Buffer;
+	try {
+		buffer = readFileSync(file);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+			return undefined;
+		}
+		throw error;
+	}
+	const entries = loadEntriesFromBuffer(buffer).filter(
+		(entry: FileEntry): entry is SessionEntry => entry.type !== "session",
+	);
+	return { entries, bytes: buffer.length };
 }
 
 /**
@@ -195,23 +214,31 @@ function statusFromBranch(entries: SessionEntry[]): "done" | "error" | "cancelle
 	return "done";
 }
 
-function findSessionFile(dir: string): string | undefined {
-	let newest: { path: string; mtime: number } | undefined;
+/** Newest session file in a dir plus the stats that key the node cache. */
+interface SessionFile {
+	path: string;
+	size: number;
+	mtimeMs: number;
+}
+
+function findSessionFile(dir: string): SessionFile | undefined {
+	let newest: { file: SessionFile; mtime: number } | undefined;
 	for (const name of readdirSync(dir)) {
 		if (!name.endsWith(".jsonl")) {
 			continue;
 		}
 		const path = join(dir, name);
 		try {
-			const mtime = statSync(path).mtime.getTime();
+			const stats = statSync(path);
+			const mtime = stats.mtime.getTime();
 			if (!newest || mtime > newest.mtime) {
-				newest = { path, mtime };
+				newest = { file: { path, size: stats.size, mtimeMs: stats.mtimeMs }, mtime };
 			}
 		} catch {
 			// Skip unreadable files.
 		}
 	}
-	return newest?.path;
+	return newest?.file;
 }
 
 function listChildSessionDirs(rlmSessionDir: string): string[] {
@@ -241,21 +268,131 @@ function listChildSessionDirs(rlmSessionDir: string): string[] {
 }
 
 /**
+ * Cache entry for one completed child session dir: the fully built node (its
+ * nested children included) plus the stats it was built from. `file` is the
+ * child's own session file; `childFiles` records every nested child dir's
+ * newest session file at build time (undefined when a dir held none), so a
+ * changed, added, or removed grandchild invalidates the parent node too.
+ * `contextWindow` is the window the node's contextUsage was computed with.
+ */
+interface ChildNodeCacheEntry {
+	file: SessionFile;
+	childFiles: Map<string, SessionFile | undefined>;
+	contextWindow: number | undefined;
+	node: ContextTreeNode;
+}
+
+/**
+ * Node cache for completed RLM child sessions, keyed by child session dir.
+ * Every top-bar cost refresh and /context invocation rebuilds the whole tree,
+ * and re-reading and re-parsing every finished child's session file dominated
+ * that work. Entries are reused only while their recorded stats still match
+ * disk, so appends, compaction rewrites, renames, deletions, and new files
+ * all force a re-parse. Hit validation covers the dir's own session file plus
+ * one level of nested child dirs; deeper descendants rely on the invariant
+ * that a session file only changes while its session is open or resident in
+ * memory, and open or resident descendants are served from their live
+ * sessions instead of this cache — a disk subtree served from a hit is static.
+ */
+const childNodeCache = new Map<string, ChildNodeCacheEntry>();
+/** Insertion-order cap so a long-lived daemon cannot accumulate entries. */
+const CHILD_NODE_CACHE_MAX = 256;
+
+/** Newest session file per nested child dir, in the same order the tree renders. */
+function listChildSessionFiles(rlmSessionDir: string): Map<string, SessionFile | undefined> {
+	const files = new Map<string, SessionFile | undefined>();
+	for (const childDir of listChildSessionDirs(rlmSessionDir)) {
+		files.set(childDir, findSessionFile(childDir));
+	}
+	return files;
+}
+
+function sameSessionFile(a: SessionFile | undefined, b: SessionFile | undefined): boolean {
+	return a !== undefined && b !== undefined && a.path === b.path && a.size === b.size && a.mtimeMs === b.mtimeMs;
+}
+
+/** True while every nested child dir still holds the same newest session file. */
+function sameChildFiles(
+	cached: Map<string, SessionFile | undefined>,
+	current: Map<string, SessionFile | undefined>,
+): boolean {
+	if (cached.size !== current.size) {
+		return false;
+	}
+	for (const [dir, file] of cached) {
+		if (!current.has(dir)) {
+			return false;
+		}
+		const other = current.get(dir);
+		if (file === undefined || other === undefined) {
+			if (file !== other) {
+				return false;
+			}
+		} else if (file.path !== other.path || file.size !== other.size || file.mtimeMs !== other.mtimeMs) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/**
+ * The model registry can change a model's context window while its session
+ * file stays unchanged (and the resolver is a fresh closure per rebuild), so
+ * cache hits compare the resolved value: a moved window forces a rebuild and
+ * contextUsage never goes stale. Nodes without a model resolved to undefined
+ * and stay valid.
+ */
+function resolvesToSameContextWindow(entry: ChildNodeCacheEntry, resolveContextWindow: ContextWindowResolver): boolean {
+	const contextWindow = entry.node.model
+		? resolveContextWindow(entry.node.model.provider, entry.node.model.id)
+		: undefined;
+	return contextWindow === entry.contextWindow;
+}
+
+/**
  * Build a context node for a completed RLM child from its persisted session
- * dir (sub-xxxx/). Children that already attributed grandchild usage carry the
- * aggregate on their assistant messages (applyChildUsageAttributions), so own
- * usage is recovered by subtracting the attribution entries. Returns undefined
- * when the dir holds no readable session.
+ * dir (sub-xxxx/), reusing the cache while the dir's session file and every
+ * nested child's file are unchanged. Children that already attributed
+ * grandchild usage carry the aggregate on their assistant messages
+ * (applyChildUsageAttributions), so own usage is recovered by subtracting the
+ * attribution entries. Returns undefined when the dir holds no readable
+ * session.
  */
 export function loadContextTreeChildFromDisk(
 	childSessionDir: string,
 	resolveContextWindow: ContextWindowResolver,
 ): ContextTreeNode | undefined {
-	const sessionFile = findSessionFile(childSessionDir);
-	if (!sessionFile) {
+	const file = findSessionFile(childSessionDir);
+	if (!file) {
+		// No readable session file (also after deleting it): never surface a
+		// previously cached node for the dir.
+		childNodeCache.delete(childSessionDir);
 		return undefined;
 	}
-	const allEntries = sessionEntriesFromFile(sessionFile);
+	const childFiles = listChildSessionFiles(childSessionDir);
+	const cached = childNodeCache.get(childSessionDir);
+	if (
+		cached &&
+		sameSessionFile(cached.file, file) &&
+		sameChildFiles(cached.childFiles, childFiles) &&
+		resolvesToSameContextWindow(cached, resolveContextWindow)
+	) {
+		return cached.node;
+	}
+	return buildContextTreeChildFromDisk(childSessionDir, file, childFiles, resolveContextWindow);
+}
+
+function buildContextTreeChildFromDisk(
+	childSessionDir: string,
+	file: SessionFile,
+	childFiles: Map<string, SessionFile | undefined>,
+	resolveContextWindow: ContextWindowResolver,
+): ContextTreeNode | undefined {
+	const read = readSessionFile(file.path);
+	if (!read) {
+		return undefined;
+	}
+	const allEntries = read.entries;
 	const branch = branchEntries(allEntries);
 	if (branch.length === 0) {
 		return undefined;
@@ -282,7 +419,7 @@ export function loadContextTreeChildFromDisk(
 
 	const contextWindow = model ? resolveContextWindow(model.provider, model.id) : undefined;
 
-	return {
+	const node: ContextTreeNode = {
 		id: basename(childSessionDir),
 		label: label || "child agent",
 		status: statusFromBranch(branch),
@@ -290,8 +427,57 @@ export function loadContextTreeChildFromDisk(
 		ownUsage,
 		totalUsage,
 		contextUsage: computeContextUsageFromEntries(allEntries, branch, contextWindow),
-		children: loadContextTreeChildrenFromDisk(childSessionDir, resolveContextWindow),
+		children: [],
 	};
+	// Nested children share the cache: each recursion re-validates its own
+	// session file, so a changed grandchild yields a fresh node here while an
+	// unchanged sibling is reused as-is.
+	for (const grandchildDir of childFiles.keys()) {
+		const childNode = loadContextTreeChildFromDisk(grandchildDir, resolveContextWindow);
+		if (childNode) {
+			node.children.push(childNode);
+		}
+	}
+	cacheBuiltChildNode(childSessionDir, file, childFiles, read.bytes, contextWindow, node);
+	return node;
+}
+
+/**
+ * Store a built node for reuse, but only when the read was a complete, stable
+ * snapshot: stat again after the read and require the size and mtime to
+ * match what findSessionFile measured before it (and the byte count actually
+ * read). An append or compaction rewrite that raced the read fails this
+ * check, skips caching, and is re-parsed on the next refresh.
+ */
+function cacheBuiltChildNode(
+	childSessionDir: string,
+	file: SessionFile,
+	childFiles: Map<string, SessionFile | undefined>,
+	bytes: number,
+	contextWindow: number | undefined,
+	node: ContextTreeNode,
+): void {
+	let stable = false;
+	try {
+		const stats = statSync(file.path);
+		stable = stats.size === bytes && stats.size === file.size && stats.mtimeMs === file.mtimeMs;
+	} catch {
+		// The file vanished mid-build; nothing to pin the stats to.
+	}
+	if (!stable) {
+		return;
+	}
+	// Delete first so a reused entry moves to the end and the cap evicts the
+	// least recently rebuilt dir first.
+	childNodeCache.delete(childSessionDir);
+	childNodeCache.set(childSessionDir, { file, childFiles, contextWindow, node });
+	while (childNodeCache.size > CHILD_NODE_CACHE_MAX) {
+		const oldest = childNodeCache.keys().next();
+		if (oldest.done) {
+			break;
+		}
+		childNodeCache.delete(oldest.value);
+	}
 }
 
 /**
