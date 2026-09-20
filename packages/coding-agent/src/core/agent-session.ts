@@ -394,6 +394,12 @@ export interface RlmChildAgentSnapshot {
 	error?: string;
 }
 
+/**
+ * RlmChildAgentSnapshot minus its two clock-derived fields: the observable
+ * state rlm_child_update events dedup on.
+ */
+export type RlmChildStableSnapshot = Omit<RlmChildAgentSnapshot, "lastActivityAt" | "activityStaleMs">;
+
 export type CompactionReason = "manual" | "threshold" | "overflow" | "requested";
 
 export type AgentSessionEvent =
@@ -1011,6 +1017,8 @@ type AutonomousRuntimeSnapshot = Pick<
 interface RlmChildRun {
 	id: string;
 	prompt: string;
+	/** Collapsed one-line prompt label; the prompt never changes, so the collapse runs once. */
+	label: string;
 	sessionName: string;
 	sessionDir: string;
 	model: Model<Api>;
@@ -1060,7 +1068,7 @@ interface RlmChildRun {
 	completeDeletion?: () => Promise<void>;
 	reportDeletionCleanupFailure?: (error: unknown) => Promise<void>;
 	emitUpdate?: () => void;
-	lastEmittedUpdate?: string;
+	lastEmittedUpdate?: RlmChildStableSnapshot;
 	unsubscribe?: () => void;
 }
 
@@ -1271,6 +1279,33 @@ export function rlmChildLabel(prompt: string): string {
 }
 
 /**
+ * Field-level equality over RlmChildStableSnapshot. Every field is a primitive
+ * except activity ({kind, toolName?}), so this decides exactly what a
+ * JSON.stringify compare of the two snapshots would, without serializing.
+ */
+function rlmChildStableFieldsEqual(a: RlmChildStableSnapshot, b: RlmChildStableSnapshot): boolean {
+	return (
+		a.id === b.id &&
+		a.parentId === b.parentId &&
+		a.sessionName === b.sessionName &&
+		a.model === b.model &&
+		a.label === b.label &&
+		a.status === b.status &&
+		a.durationMs === b.durationMs &&
+		a.answerPreview === b.answerPreview &&
+		a.toolUseCount === b.toolUseCount &&
+		a.tokenCount === b.tokenCount &&
+		a.recap === b.recap &&
+		a.sessionDir === b.sessionDir &&
+		a.activity?.kind === b.activity?.kind &&
+		a.activity?.toolName === b.activity?.toolName &&
+		a.repliedSinceTask === b.repliedSinceTask &&
+		a.progressNote === b.progressNote &&
+		a.error === b.error
+	);
+}
+
+/**
  * Record a tracked child activity on both clocks: lastActivityAt stays
  * wall-clock ms for snapshots, and its monotonic twin bounds staleness so a
  * host sleep cannot inflate it.
@@ -1389,11 +1424,8 @@ export class AgentSession {
 
 	private _unsubscribeAgent?: () => void;
 	private _eventListeners: AgentSessionEventListener[] = [];
-	private _lastSessionActionSnapshot: SessionActionSnapshot = {
-		queuedCount: 0,
-		steering: [],
-		followUps: [],
-	};
+	/** Serialized last-emitted queue snapshot, so a mutation pays one stringify, not two. */
+	private _lastSessionActionSnapshot = JSON.stringify({ queuedCount: 0, steering: [], followUps: [] });
 	private _agentEventQueue: Promise<void> = Promise.resolve();
 
 	/** Session-owned actions. Items are never fed into Agent.steer/followUp. */
@@ -1921,8 +1953,9 @@ export class AgentSession {
 
 	private _emitQueueUpdate(): void {
 		const actions = this.getSessionActionSnapshot();
-		if (JSON.stringify(actions) === JSON.stringify(this._lastSessionActionSnapshot)) return;
-		this._lastSessionActionSnapshot = actions;
+		const serialized = JSON.stringify(actions);
+		if (serialized === this._lastSessionActionSnapshot) return;
+		this._lastSessionActionSnapshot = serialized;
 		this._emit({ type: "session_action_update", actions });
 	}
 
@@ -11566,7 +11599,7 @@ export class AgentSession {
 			parentId: this._rlmParentNodeId,
 			sessionName: child?.sessionName ?? run.sessionName,
 			model: `${model.provider}/${model.id}`,
-			label: rlmChildLabel(run.prompt),
+			label: run.label,
 			status: run.status,
 			durationMs: run.durationMs,
 			answerPreview: run.answerPreview,
@@ -12058,6 +12091,7 @@ export class AgentSession {
 		const run: RlmChildRun = {
 			id: childNodeId,
 			prompt,
+			label: rlmChildLabel(prompt),
 			sessionName,
 			sessionDir: childSessionDir,
 			model: modelSelection.model,
@@ -12080,17 +12114,37 @@ export class AgentSession {
 		this._activeRlmChildRuns.set(run.id, run);
 		this._unsettledRlmChildRuns.add(run);
 		const emitChildUpdate = () => {
-			const child = this._rlmChildSnapshotForRun(run);
 			// Dedup compares observable child state, not clock-derived fields:
 			// lastActivityAt advances on every streamed token delta and
 			// activityStaleMs is recomputed on each snapshot build, so including
 			// either would re-emit on every delta once answerPreview saturates its
-			// cap. Emitted snapshots still carry both fields fresh.
-			const { lastActivityAt: _lastActivityAt, activityStaleMs: _activityStaleMs, ...stable } = child;
-			const serialized = JSON.stringify(stable);
-			if (serialized === run.lastEmittedUpdate) return;
-			run.lastEmittedUpdate = serialized;
-			this._emit({ type: "rlm_child_update", child });
+			// cap. The comparison projects the stable fields directly — streamed
+			// deltas would otherwise pay a snapshot build plus a serialization
+			// each — and only a detected change builds the fresh snapshot, which
+			// carries both clock fields.
+			const child = run.session ?? this._rlmChildSessions.get(run.id)?.session;
+			const model = child?.model ?? run.model;
+			const next: RlmChildStableSnapshot = {
+				id: run.id,
+				parentId: this._rlmParentNodeId,
+				sessionName: child?.sessionName ?? run.sessionName,
+				model: `${model.provider}/${model.id}`,
+				label: run.label,
+				status: run.status,
+				durationMs: run.durationMs,
+				answerPreview: run.answerPreview,
+				toolUseCount: run.toolUseCount > 0 ? run.toolUseCount : undefined,
+				tokenCount: child?._contextTokensForCurrentMessages(),
+				recap: child?.getCurrentRecap(),
+				sessionDir: run.sessionDir,
+				activity: run.activity,
+				repliedSinceTask: child?._repliedToParentSinceTask,
+				progressNote: run.progressNotes.at(-1),
+				error: run.error,
+			};
+			if (run.lastEmittedUpdate && rlmChildStableFieldsEqual(run.lastEmittedUpdate, next)) return;
+			run.lastEmittedUpdate = next;
+			this._emit({ type: "rlm_child_update", child: this._rlmChildSnapshotForRun(run) });
 		};
 		run.emitUpdate = emitChildUpdate;
 		emitChildUpdate();
@@ -13740,7 +13794,7 @@ export class AgentSession {
 					children: [],
 				}),
 				id: run.id,
-				label: rlmChildLabel(run.prompt),
+				label: run.label,
 				status: run.status,
 			});
 		}
