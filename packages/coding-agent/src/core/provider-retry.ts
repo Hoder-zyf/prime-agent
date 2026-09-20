@@ -60,12 +60,9 @@ export function providerStreamFailureStatus(message: AssistantMessage): number |
  * Deterministic rejections never retry; auth gets one retry before it can be
  * marked stale. A 404 is the exception: a live model briefly 404s on routing
  * blips (observed 2026-09-13 killing every active session), so it counts as
- * transient unavailability, not a permanent rejection. Safety filters are
- * deterministic rejections too: the identical request is blocked again every
- * time (observed 2026-09-09: one session logged four identical prime-inference
- * content_filter failures, burning all 3 auto-retries and ~14s), so like
- * refusal they never retry, agreeing with providerWaitClass, which already
- * routes safety as permanent.
+ * transient unavailability, not a permanent rejection. Safety filters
+ * deterministically reject identical requests, so like refusal and permission
+ * they never retry; providerWaitClass routes safety as permanent too.
  */
 export function isPermanentProviderFailureKind(
 	kind: string | undefined,

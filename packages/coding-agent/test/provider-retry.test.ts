@@ -3,7 +3,6 @@ import { describe, expect, it, vi } from "vitest";
 import {
 	completeWithProviderRetry,
 	DEFAULT_PROVIDER_WAIT_POLICY,
-	isPermanentProviderFailureKind,
 	type ProviderWaitPolicy,
 	parseProviderResetMs,
 	providerRetryDelay,
@@ -52,7 +51,6 @@ describe("completeWithProviderRetry", () => {
 		{ kind: undefined, policy: { enabled: false, maxRetries: 3, baseDelayMs: 1, maxRetryDelayMs: 60_000 } },
 		{ kind: "safety", policy: { enabled: true, maxRetries: 3, baseDelayMs: 1, maxRetryDelayMs: 60_000 } },
 	])("PR#2472: single attempt when retries are disabled or the failure is permanent", async ({ kind, policy }) => {
-		expect(isPermanentProviderFailureKind("safety", 0)).toBe(true);
 		const attempt = vi.fn(async () => providerError(kind));
 		const result = await completeWithProviderRetry(attempt, { policy });
 		expect(result.stopReason).toBe("error");
