@@ -682,6 +682,29 @@ class ReplTest(unittest.TestCase):
             events = self.repl.execute("p3", "'big' in dir()")
             self.assertEqual(one(events, "result")["text"], "False")
 
+    def test_prune_after_rebinding_uses_the_new_size(self):
+        # The tracked size from the first snapshot must not outlive the cell that
+        # rebinds the name: the prune measures the small replacement instead of
+        # deleting it on a stale "oversized" marker.
+        with tempfile.TemporaryDirectory() as tmp:
+            base = {
+                "type": "snapshot",
+                "path": os.path.join(tmp, "kernel-state.dill"),
+                "manifest_path": os.path.join(tmp, "kernel-state.json"),
+                "max_variable_bytes": 1024,
+            }
+            self.repl.execute("pk1", "big = b'x' * 100_000\nkeep = 1")
+            self.repl.send({"id": "pk2", **base})
+            done = one(self.repl.until_done("pk2"), "done")
+            self.assertEqual(done["status"], "ok")
+            self.assertEqual([entry["name"] for entry in done["skipped"]], ["big"])
+            self.repl.execute("pk3", "big = 1")
+            self.repl.send({"id": "pk4", "prune_oversized": True, **base})
+            done = one(self.repl.until_done("pk4"), "done")
+            self.assertEqual(done["status"], "ok")
+            self.assertEqual(done["pruned"], [])
+            self.assertEqual(done["saved"], ["big", "keep"])
+
     def test_emit_display(self):
         payloads = {
             "application/vnd.prime-agent.diff+json": {
@@ -2098,11 +2121,11 @@ class SnapshotTempCleanupTest(unittest.TestCase):
 
             real_dump = dill.dump
 
-            def interrupted_dump(payload, fh):
-                if isinstance(payload, dict):  # the complete payload, not a per-variable value
-                    fh.write(b"partial")
-                    raise KeyboardInterrupt
-                return real_dump(payload, fh)
+            def interrupted_dump(value, fh):
+                # The single-pass payload write dumps one variable at a time into
+                # the staged temp; interrupt mid-dump, after partial bytes landed.
+                fh.write(b"partial")
+                raise KeyboardInterrupt
 
             with unittest_mock.patch.object(dill, "dump", interrupted_dump):
                 with self.assertRaises(KeyboardInterrupt):
@@ -2194,19 +2217,22 @@ class SnapshotPairConsistencyTest(unittest.TestCase):
     def test_near_cap_payload_skips_tail_instead_of_failing_snapshot(self):
         import dill
 
+        from rlm.repl import _SNAPSHOT_MAGIC, _restore_state
+
         dill.settings["recurse"] = True
         source = {"a": "first", "b": "second"}
         blobs = {name: dill.dumps(value) for name, value in source.items()}
-        cap = len(dill.dumps(blobs)) - 1
-        self.assertLessEqual(sum(map(len, blobs.values())), cap)
-        self.assertLessEqual(len(dill.dumps({"a": blobs["a"]})), cap)
+        # One byte short of the full single-pass payload (magic + both records),
+        # so "a" fits exactly and "b" overflows the remaining aggregate budget.
+        cap = len(_SNAPSHOT_MAGIC) + 13 + len(blobs["a"]) + 13 + len(blobs["b"]) - 1
 
         result = self._snap(source, max_bytes=cap, max_variable_bytes=cap)
         self.assertEqual(result["saved"], ["a"])
         self.assertEqual(result["skipped"], [{"name": "b", "reason": "exceeds aggregate snapshot size cap"}])
         self.assertLessEqual(result["bytes"], cap)
-        with open(self.path, "rb") as fh:
-            self.assertEqual(list(dill.load(fh)), ["a"])
+        ns: dict = {}
+        self.assertNotIn("error", _restore_state(ns, self.path))
+        self.assertEqual(ns, {"a": "first"})
 
     def test_manifest_write_failure_preserves_prior_pair(self):
         old_payload, old_manifest = self._old_pair()
@@ -2390,6 +2416,81 @@ class SnapshotPairConsistencyTest(unittest.TestCase):
                 with open(manifest_path) as fh:
                     self.assertEqual(json.load(fh)["savedNames"], ["keep"])
                 self.assertEqual(sorted(os.listdir(d)), sorted([payload_name, manifest_name]))
+
+
+class SnapshotSinglePassTest(SnapshotPairConsistencyTest):
+    """The v2 payload writes one serialization pass per variable, with tracked sizes."""
+
+    def setUp(self):
+        import rlm.repl as repl_module
+
+        super().setUp()
+        self.repl = repl_module
+        self.repl._name_sizes.clear()  # the tracked-size cache is module state
+        self.addCleanup(self.repl._name_sizes.clear)
+
+    def test_each_variable_serialized_once_and_payload_is_not_a_pickle(self):
+        import dill
+
+        real_dump = dill.dump
+        dumped: list[object] = []
+
+        def counting_dump(value, writer):
+            dumped.append(value)
+            return real_dump(value, writer)
+
+        with mock.patch.object(dill, "dump", counting_dump):
+            result = self._snap({"a": 1, "b": 2, "c": 3})
+        self.assertEqual(result["saved"], ["a", "b", "c"])
+        self.assertEqual(dumped, [1, 2, 3])  # one dill pass per variable, no re-dump
+        self.assertEqual(result["bytes"], os.path.getsize(self.path))
+        with open(self.path, "rb") as fh:
+            self.assertEqual(fh.read(len(self.repl._SNAPSHOT_MAGIC)), self.repl._SNAPSHOT_MAGIC)
+            with self.assertRaises(Exception):
+                dill.load(fh)  # the framed v2 payload is not a pickle
+
+    def test_prune_uses_tracked_sizes_and_cell_invalidation(self):
+        import ast
+
+        import dill
+
+        ns = {"big": b"x" * 100_000, "keep": 1}
+        self._snap(ns, max_variable_bytes=1024)  # tracks "big" as over-cap
+        real_dump = dill.dump
+
+        def refuse_big_dump(value, writer):
+            assert value is not ns["big"], "prune re-serialized a tracked-oversized variable"
+            return real_dump(value, writer)
+
+        with mock.patch.object(dill, "dump", refuse_big_dump):
+            pruned = self._snap(ns, max_variable_bytes=1024, prune_oversized=True)
+        self.assertEqual(pruned["pruned"], ["big"])  # deleted without re-serializing
+        self.assertNotIn("big", ns)
+        self.assertNotIn("big", self.repl._name_sizes)  # pruned entries are dropped
+
+        # A rebound name must lose its tracked size, or a stale marker would
+        # wrongly prune the now-small replacement.
+        ns["big"] = b"y" * 100_000
+        self._snap(ns, max_variable_bytes=1024)  # re-track the fresh oversized value
+        self.repl._compile_cell("big = 1", "<cell-rebind>")
+        ns["big"] = 1  # the rebind the cell applies
+        pruned = self._snap(ns, max_variable_bytes=1024, prune_oversized=True)
+        self.assertEqual(pruned["pruned"], [])
+        self.assertEqual(pruned["saved"], ["big", "keep"])
+
+        # Walker coverage: match captures, except-as, del, and a nested `global`
+        # all invalidate; a nested scope's plain locals do not.
+        code = (
+            "match d:\n    case [_, *tail]:\n        pass\n    case {'k': cap, **rest}:\n        pass\n"
+            "try:\n    pass\nexcept ValueError as err:\n    pass\n"
+            "def f():\n    global stale\n    stale = 1\ndel gone\n"
+        )
+        self.assertEqual(self.repl._names_bound_or_deleted(ast.parse(code)), {"cap", "err", "gone", "rest", "stale", "tail"})
+        self.assertEqual(self.repl._names_bound_or_deleted(ast.parse("def f():\n    big = None\n")), set())
+        # A star import can rebind any public name: the whole cache is dropped.
+        self.repl._name_sizes["anything"] = 5
+        self.repl._compile_cell("from os import *\n", "<cell-star>")
+        self.assertEqual(self.repl._name_sizes, {})
 
 
 class OwnerWatchdogTest(unittest.TestCase):

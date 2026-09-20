@@ -1,8 +1,8 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { ReplKernelManager } from "../src/core/kernel/index.js";
 
 function resolveReplPython(): string | null {
@@ -191,4 +191,55 @@ describeIfKernel("repl kernel state snapshot round-trip (real runtime)", { tags:
 			rmSync(autoDir, { recursive: true, force: true });
 		}
 	}, 60_000);
+
+	it("skips the post-restore auto-snapshot when nothing changed, and snapshots again after a user cell", async () => {
+		const writer = newManager();
+		await writer.execute("restored_var = 'from-disk'");
+		await writer.shutdown({ snapshot: true, drainHostRequests: true });
+
+		const reader = new ReplKernelManager({
+			python: python as string,
+			cwd: dir,
+			snapshot: { path: snapshotPath, manifestPath, debounceMs: 50 },
+		});
+		try {
+			expect((await reader.restoreState())?.restored).toContain("restored_var");
+			vi.useFakeTimers();
+			// Production order: the bootstrap-like execute schedules the debounced
+			// auto-snapshot, then the arm marks the restored namespace as fresh.
+			await reader.execute("pass");
+			reader.markRestoredNamespaceFresh();
+			const statBefore = statSync(manifestPath);
+			await vi.advanceTimersByTimeAsync(300);
+			// A capture the debounce enqueued anyway would settle ahead of this request.
+			await reader.listNamespaceNames();
+			expect(statSync(manifestPath).mtimeMs).toBe(statBefore.mtimeMs);
+			expect(statSync(manifestPath).size).toBe(statBefore.size);
+
+			// A user cell completing after the arm must snapshot normally again.
+			await reader.execute("user_var = 7");
+			await vi.advanceTimersByTimeAsync(300);
+			await reader.listNamespaceNames();
+			const manifestAfter = JSON.parse(readFileSync(manifestPath, "utf8")) as { savedNames: string[] };
+			expect(manifestAfter.savedNames).toEqual(expect.arrayContaining(["restored_var", "user_var"]));
+
+			// A failed or timed-out restore must arm too: the debounced auto-snapshot
+			// would otherwise clobber the on-disk copy with a skills-only payload.
+			writeFileSync(snapshotPath, "not-a-snapshot");
+			expect(await reader.restoreState()).toBeNull();
+			await reader.execute("pass");
+			reader.markRestoredNamespaceFresh();
+			await vi.advanceTimersByTimeAsync(300);
+			await reader.listNamespaceNames();
+			expect(readFileSync(snapshotPath, "utf8")).toBe("not-a-snapshot");
+			await reader.execute("user_var2 = 9");
+			await vi.advanceTimersByTimeAsync(300);
+			await reader.listNamespaceNames();
+			const manifest2 = JSON.parse(readFileSync(manifestPath, "utf8")) as { savedNames: string[] };
+			expect(manifest2.savedNames).toContain("user_var2");
+		} finally {
+			vi.useRealTimers();
+			await reader.shutdown({ snapshot: true, drainHostRequests: true });
+		}
+	});
 });

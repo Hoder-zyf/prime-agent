@@ -484,6 +484,7 @@ export class IpythonKernelProvisioner {
 				bootstrapCode,
 			});
 			let pendingRestore: RestoreResult | undefined;
+			let snapshotExisted = false;
 			try {
 				// Emitted synchronously (before the permit await) so a listener attaching
 				// mid-flight can replay the current stage.
@@ -504,7 +505,7 @@ export class IpythonKernelProvisioner {
 				// Revive a prior session's namespace before the bootstrap, so the bootstrap
 				// then overwrites live handles (rlm, skills) on top of anything restored.
 				if (snapshotDir) {
-					const snapshotExisted = existsSync(snapshotPathIn(snapshotDir));
+					snapshotExisted = existsSync(snapshotPathIn(snapshotDir));
 					this.emitStartupProgress("Restoring Python state...");
 					const restore = await raceWithAbort(m.restoreState(), startupSignal);
 					if (snapshotExisted) {
@@ -518,6 +519,13 @@ export class IpythonKernelProvisioner {
 				if (bootstrap.status !== "ok") {
 					const details = [bootstrap.stderr, bootstrap.error?.traceback.join("\n")].filter(Boolean).join("\n");
 					throw new Error(`Failed to initialize rlm runtime in the Python kernel:\n${details}`);
+				}
+				if (snapshotExisted) {
+					// A restore ran against the existing snapshot files. The bootstrap's
+					// own auto-snapshot would rewrite the restored namespace — or, when the
+					// restore failed or timed out, clobber the healthy on-disk copy with a
+					// skills-only payload. Arm the one-shot skip either way.
+					m.markRestoredNamespaceFresh();
 				}
 			} catch (error) {
 				// Never leak the kernel process if startup fails after spawn — and never
