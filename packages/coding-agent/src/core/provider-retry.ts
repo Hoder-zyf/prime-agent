@@ -81,19 +81,31 @@ export type ProviderRetryDelay = { kind: "wait"; delayMs: number } | { kind: "ex
 /** Node caps timers at 2^31-1 ms; longer delays overflow setTimeout and fire after ~1ms. */
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
-/** Delay before retry `attempt` (1-based), honoring a server-requested wait. */
+/**
+ * Delay before retry `attempt` (1-based), honoring a server-requested wait.
+ * The computed backoff gets +/-25% jitter so concurrent sessions do not retry
+ * an outage in lockstep; a server-requested wait is honored exactly, and
+ * jitter never waits less than the server asked.
+ */
 export function providerRetryDelay(
 	attempt: number,
 	retryAfterMs: number | undefined,
 	policy: Pick<ProviderRetryPolicy, "baseDelayMs" | "maxRetryDelayMs">,
+	rng: () => number = Math.random,
 ): ProviderRetryDelay {
 	if (retryAfterMs !== undefined && policy.maxRetryDelayMs > 0 && retryAfterMs > policy.maxRetryDelayMs) {
 		return { kind: "exceeds-cap", retryAfterMs };
 	}
-	return {
-		kind: "wait",
-		delayMs: Math.min(Math.max(policy.baseDelayMs * 2 ** (attempt - 1), retryAfterMs ?? 0), MAX_TIMER_DELAY_MS),
-	};
+	const backoffMs = policy.baseDelayMs * 2 ** (attempt - 1);
+	if (retryAfterMs !== undefined && retryAfterMs >= backoffMs) {
+		// The server said when it will accept the next request; honor that wait exactly.
+		return { kind: "wait", delayMs: Math.min(retryAfterMs, MAX_TIMER_DELAY_MS) };
+	}
+	// Jitter de-synchronizes sessions retrying the same outage; the server wait stays a floor.
+	const jitteredMs = providerWaitJitter(backoffMs, rng);
+	const flooredMs = Math.max(jitteredMs, retryAfterMs ?? 0);
+	const clampedMs = Math.min(flooredMs, MAX_TIMER_DELAY_MS);
+	return { kind: "wait", delayMs: clampedMs };
 }
 
 /**
@@ -204,7 +216,7 @@ export function providerWaitPingDelay(
 	return Math.min(capped, MAX_TIMER_DELAY_MS);
 }
 
-/** +/-25% jitter around a ping delay (avoids thundering-herd retries). */
+/** +/-25% jitter around a delay (avoids thundering-herd retries). */
 export function providerWaitJitter(delayMs: number, rng: () => number = Math.random): number {
 	const factor = 0.75 + 0.5 * Math.max(0, Math.min(1, rng()));
 	return Math.max(0, Math.round(delayMs * factor));
