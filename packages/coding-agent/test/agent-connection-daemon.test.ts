@@ -1467,19 +1467,21 @@ describe("DaemonAgentConnection", () => {
 		expect(closedError).toContain("Diagnostic log:");
 	});
 
+	function announceClose(reason: "shutdown" | "killed", fakeClient: FakeDaemonClient) {
+		fakeClient.emitMessage({ type: "daemon_closing", reason: "shutdown" });
+		fakeClient.emitMessage({ type: "session_closed", activeSessionId: "active-original", reason });
+	}
+
 	it.each([
 		[
 			"shutdown socket close",
 			(fakeClient: FakeDaemonClient) =>
 				fakeClient.emitClose(new DaemonSocketClosedError("/tmp/prime-agent.sock", "shutdown")),
 		],
-		[
-			"announced orderly daemon shutdown",
-			(fakeClient: FakeDaemonClient) => {
-				fakeClient.emitMessage({ type: "daemon_closing", reason: "shutdown" });
-				fakeClient.emitMessage({ type: "session_closed", activeSessionId: "active-original", reason: "shutdown" });
-			},
-		],
+		// An orderly supervisor shutdown archive-stops its workers, so attached windows
+		// read the relayed close as "killed"; a direct worker link closes as "shutdown".
+		["announced daemon shutdown", (fakeClient: FakeDaemonClient) => announceClose("shutdown", fakeClient)],
+		["announced supervisor shutdown", (fakeClient: FakeDaemonClient) => announceClose("killed", fakeClient)],
 	])("recovers a %s by reconnecting to the restarted daemon", async (_closeKind, triggerClose) => {
 		const fakeClient = new FakeDaemonClient();
 		fakeClient.hello = { ...fakeClient.hello!, appVersion: "test-daemon-version" };

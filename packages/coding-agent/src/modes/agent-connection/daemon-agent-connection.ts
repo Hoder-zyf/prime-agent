@@ -2136,9 +2136,13 @@ export class DaemonAgentConnection implements AgentConnection {
 				void this.reconnectAfterUpdate();
 				return;
 			}
-			if (message.reason === "shutdown" && this.daemonClosingNotice === "shutdown") {
+			const daemonShutdownClose =
+				this.daemonClosingNotice === "shutdown" && (message.reason === "shutdown" || message.reason === "killed");
+			if (daemonShutdownClose) {
 				// The daemon itself is going away (daemon_closing announced it): recover the
-				// window when it comes back. A bare session stop has no notice and stays stopped.
+				// window when it comes back. An orderly supervisor shutdown archive-stops its
+				// workers, so the relayed session_closed arrives with reason "killed"; the
+				// notice, not the close reason, separates this from a bare session stop.
 				this.captureDaemonLogPath();
 				void this.reconnectAfterShutdown();
 				return;
