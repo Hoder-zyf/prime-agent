@@ -45,9 +45,11 @@ import {
 } from "./prime-inference-models.js";
 import { BUILT_IN_PROVIDER_DISPLAY_NAMES } from "./provider-display-names.js";
 import {
-	resolveConfigValueOrThrow,
+	invalidateCommandTtlCacheEntry,
+	resolveConfigValueAsync,
+	resolveConfigValueOrThrowAsync,
 	resolveConfigValueUncached,
-	resolveHeadersOrThrow,
+	resolveHeadersOrThrowAsync,
 } from "./resolve-config-value.js";
 
 const PercentileCutoffsSchema = Type.Object({
@@ -1389,7 +1391,27 @@ export class ModelRegistry {
 		return source !== undefined && !this.isProviderRequestAuthStaleForStatus(provider, source);
 	}
 
+	/**
+	 * Drop the TTL-cached results of every `!command` config backing this
+	 * provider's request auth (API key and provider headers) so the next
+	 * request re-runs them: an auth failure means the credential may have
+	 * rotated and the stale output must not be served again.
+	 */
+	private invalidateProviderCommandResults(provider: string): void {
+		const providerConfig = this.providerRequestConfigs.get(provider);
+		if (!providerConfig) return;
+		if (providerConfig.apiKey?.startsWith("!")) {
+			invalidateCommandTtlCacheEntry(providerConfig.apiKey);
+		}
+		for (const value of Object.values(providerConfig.headers ?? {})) {
+			if (value.startsWith("!")) {
+				invalidateCommandTtlCacheEntry(value);
+			}
+		}
+	}
+
 	markProviderAuthStale(provider: string): boolean {
+		this.invalidateProviderCommandResults(provider);
 		if (this.authStorage.markAuthStale(provider)) {
 			return true;
 		}
@@ -1435,6 +1457,7 @@ export class ModelRegistry {
 	}
 
 	markProviderAuthSourceStale(token: AuthSourceToken): boolean {
+		this.invalidateProviderCommandResults(token.provider);
 		let marked = false;
 		const providerRequestSource = this.getProviderRequestAuthSource(token.provider);
 		if (
@@ -1507,7 +1530,7 @@ export class ModelRegistry {
 			let apiKey = authStorageAuth.apiKey;
 			let authSourceToken = authStorageAuth.sourceToken;
 			if (apiKey === undefined && providerConfig?.apiKey) {
-				const resolvedApiKey = resolveConfigValueOrThrow(
+				const resolvedApiKey = await resolveConfigValueOrThrowAsync(
 					providerConfig.apiKey,
 					`API key for provider "${model.provider}"`,
 				);
@@ -1519,6 +1542,10 @@ export class ModelRegistry {
 					this.clearStaleProviderRequestAuthSource(model.provider, providerRequestAuthSource);
 					apiKey = resolvedApiKey;
 					authSourceToken = this.getProviderRequestAuthSourceToken(model.provider, providerRequestAuthSource);
+				} else if (providerRequestAuthSource) {
+					// The resolved command output is known stale: drop its cached
+					// result so the next request re-runs the command.
+					this.invalidateProviderCommandResults(model.provider);
 				}
 			}
 			this.setLastProviderAuthSourceToken(model.provider, apiKey === undefined ? undefined : authSourceToken);
@@ -1542,9 +1569,12 @@ export class ModelRegistry {
 				}
 			}
 
-			const providerHeaders = resolveHeadersOrThrow(providerConfig?.headers, `provider "${model.provider}"`);
+			const providerHeaders = await resolveHeadersOrThrowAsync(
+				providerConfig?.headers,
+				`provider "${model.provider}"`,
+			);
 			const authStorageHeaders = this.authStorage.getProviderHeaders(model.provider);
-			const modelHeaders = resolveHeadersOrThrow(
+			const modelHeaders = await resolveHeadersOrThrowAsync(
 				this.modelRequestHeaders.get(this.getModelRequestKey(model.provider, model.id)),
 				`model "${model.provider}/${model.id}"`,
 			);
@@ -1648,7 +1678,7 @@ export class ModelRegistry {
 			return undefined;
 		}
 
-		const resolvedApiKey = resolveConfigValueUncached(providerApiKey);
+		const resolvedApiKey = await resolveConfigValueAsync(providerApiKey);
 		if (resolvedApiKey === undefined) {
 			this.setLastProviderAuthSourceToken(provider, undefined);
 			return undefined;
@@ -1656,6 +1686,11 @@ export class ModelRegistry {
 		const source = this.getProviderRequestAuthSource(provider, { resolvedApiKey });
 		if (!source || this.isProviderRequestAuthStale(provider, source)) {
 			this.setLastProviderAuthSourceToken(provider, undefined);
+			if (source) {
+				// The resolved command output is known stale: drop its cached
+				// result so the next request re-runs the command.
+				this.invalidateProviderCommandResults(provider);
+			}
 			return undefined;
 		}
 		this.clearStaleProviderRequestAuthSource(provider, source);

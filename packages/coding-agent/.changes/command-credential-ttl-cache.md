@@ -1,0 +1,1 @@
+- Command-backed credentials and headers no longer spawn a blocking shell per request: per-request !command resolution is async and shares one result per short TTL window, concurrent requests dedupe the exec, and auth failures invalidate the cached result so rotated credentials land on the next request.
