@@ -689,6 +689,32 @@ class ReplTest(unittest.TestCase):
             events = self.repl.execute("pt4", "G = 2\nwrapped()")
             self.assertEqual(one(events, "result")["text"], "2")
 
+    def _snapshot_restore(self, rid: str, code: str, tmp: str) -> None:
+        self.assertEqual(one(self.repl.execute(rid + "0", code), "done")["status"], "ok")
+        self.repl.send({"type": "snapshot", "id": rid + "1", "path": os.path.join(tmp, "s.dill"), "manifest_path": os.path.join(tmp, "s.json")})
+        self.repl.send({"type": "restore", "id": rid + "2", "path": os.path.join(tmp, "s.dill")})
+        self.assertEqual(one(self.repl.until_done(rid + "2"), "done")["status"], "ok")
+
+    def test_restore_rebuilt_partial_keeps_attributes_and_args_pr2471(self):
+        code = (
+            "import functools\nG = 1\ndef helper():\n    return G\ndef apply(fn):\n    return fn()\n"
+            "wrapped = functools.partial(apply, helper)\nwrapped.label = 'x'"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            self._snapshot_restore("pa", code, tmp)
+            self.assertEqual(one(self.repl.execute("pa4", "wrapped.label"), "result")["text"], "'x'")
+            self.assertEqual(one(self.repl.execute("pa5", "G = 2\nwrapped()"), "result")["text"], "2")
+
+    def test_restore_backfill_skips_excluded_names_pr2471(self):
+        code = (
+            "exec('PUB = 1\\n_hidden = 2\\nIn = 3\\nOut = 4\\ndef user():\\n    return (PUB, _hidden, In, Out)', pn:={'__name__': '__main__'})\n"
+            "user = pn['user']"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            self._snapshot_restore("ex", code, tmp)
+            probe = "('PUB' in dir(), '_hidden' in dir(), 'In' in dir(), 'Out' in dir())"
+            self.assertEqual(one(self.repl.execute("ex4", probe), "result")["text"], "(True, False, False, False)")
+
     def test_snapshot_prune_oversized(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "kernel-state.dill")
@@ -2044,6 +2070,14 @@ class RestoreApplyShieldTest(unittest.TestCase):
         self.assertNotIn("error", result)
         self.assertEqual(result["restored"], ["a", "b"])
         self.assertEqual(dict(ns), {"a": 1, "b": 2})
+
+    def test_sigint_with_backfill_first_write_is_consumed(self):
+        from rlm.repl import _restore_state
+        exec("SECRET = 42\ndef reader():\n    return SECRET", source := {"__name__": "__main__"})
+        with tempfile.TemporaryDirectory() as tmp:
+            ns = self.SigintOnNthSet(fire_on=1)
+            result = _restore_state(ns, self._write_snapshot(tmp, {"reader": source["reader"]}))
+        self.assertEqual((result["restored"], ns["SECRET"]), (["reader"], 42))
 
     def _restore_with_sigint_at_unpark(self):
         """Real unparking swap, then the newly restored handler fires immediately."""

@@ -818,42 +818,79 @@ def _snapshot_state(
     return result
 
 
-def _revive_with_live_globals(value: Any, ns: dict[str, Any]) -> Any:
+def _revive_with_live_globals(
+    value: Any,
+    ns: dict[str, Any],
+    backfill: list[tuple[str, Any]] | None = None,
+    memo: dict[int, Any] | None = None,
+) -> Any:
     """Rebind restored __main__ callables onto the live namespace.
 
     A saved __main__ function is rebuilt with ns as its __globals__ so later
     cells read live values, keeping dill's other revival fidelity: docstring,
-    keyword-only defaults, annotations, qualname, module, attribute dict.
-    Names its revival globals carry that ns lacks (private exec dicts,
-    snapshot-pruned names) are backfilled into ns with their last-known
-    values; the live ns always wins. A functools.partial wrapping such a
-    function is rebuilt around the revived function; everything else — dill's
-    by-reference revivals like imported functions, or by-value user __main__
-    classes keeping dill's own revived globals — passes through untouched.
+    keyword-only defaults, annotations, type params, qualname, module,
+    attribute dict. Names its revival globals carry that ns lacks (private
+    exec dicts, snapshot-pruned names) are collected as backfill (name,
+    revived value) pairs — each value itself rebound, so nested helpers read
+    the live namespace too — for the caller to apply when the restore commits;
+    the live ns always wins, and excluded names (leading-underscore and
+    always/restore-skip) are never collected. A functools.partial wrapping such
+    a function — or carrying one in its args/keywords — is rebuilt around the
+    revived callables, keeping its own attribute dict; everything else —
+    dill's by-reference revivals like imported functions, or by-value user
+    __main__ classes keeping dill's own revived globals — passes through
+    untouched. memo breaks cycles in the callable graph.
     """
     import functools
 
+    if memo is None:
+        memo = {}
+    if id(value) in memo:
+        return memo[id(value)]
     if isinstance(value, functools.partial):
-        # Revive the wrapped callable when it is a __main__ function (nested
-        # partials recurse); a partial of anything else passes through.
-        rebuilt = _revive_with_live_globals(value.func, ns)
-        if rebuilt is value.func:
+        # Register before recursing: a callable graph can loop back here.
+        memo[id(value)] = value
+        rebuilt = _revive_with_live_globals(value.func, ns, backfill, memo)
+        changed = rebuilt is not value.func
+        args = []
+        keywords = {}
+        for arg in value.args:
+            revived = _revive_with_live_globals(arg, ns, backfill, memo)
+            changed = changed or revived is not arg
+            args.append(revived)
+        for key, arg in value.keywords.items():
+            revived = _revive_with_live_globals(arg, ns, backfill, memo)
+            changed = changed or revived is not arg
+            keywords[key] = revived
+        if not changed:
             return value
-        return functools.partial(rebuilt, *value.args, **value.keywords)
+        rebuilt_partial = functools.partial(rebuilt, *args, **keywords)
+        rebuilt_partial.__dict__.update(value.__dict__)
+        memo[id(value)] = rebuilt_partial
+        return rebuilt_partial
     if not isinstance(value, types.FunctionType) or value.__module__ != "__main__":
         return value
     rebound = types.FunctionType(value.__code__, ns, value.__name__, value.__defaults__, value.__closure__)
-    # Backfill only what ns is missing (never clobber live values) and skip
-    # module machinery dunders such as __builtins__ and __name__.
-    for name, dep in value.__globals__.items():
-        if name not in ns and not (name.startswith("__") and name.endswith("__")):
-            ns[name] = dep
+    memo[id(value)] = rebound
+    # Collect only what ns is missing (never clobber live values), never
+    # smuggle names past the restore exclusions, and revive each value so
+    # backfilled helpers read the live namespace too (memo breaks cycles).
+    if backfill is not None:
+        for name, dep in value.__globals__.items():
+            if name in ns or name.startswith("_") or name in _ALWAYS_SKIP or name in _RESTORE_SKIP:
+                continue
+            backfill.append((name, _revive_with_live_globals(dep, ns, backfill, memo)))
     rebound.__doc__ = value.__doc__
     rebound.__kwdefaults__ = value.__kwdefaults__
     rebound.__dict__.update(value.__dict__)
     rebound.__annotations__ = value.__annotations__
     rebound.__qualname__ = value.__qualname__
     rebound.__module__ = value.__module__
+    # PEP 695 generics carry their type params here on 3.12+; plain 3.11
+    # functions lack the attribute entirely, hence the getattr guard.
+    params = getattr(value, "__type_params__", None)
+    if params is not None:
+        rebound.__type_params__ = params
     return rebound
 
 
@@ -885,11 +922,14 @@ def _restore_state(
             failed.append({"name": name, "reason": f"{type(err).__name__}: {_safe_str(err)[:200]}"})
     # Revive every staged name before parking: a revival failure must never
     # abort the apply loop halfway and leave the namespace half old, half new.
+    # Backfill pairs collect alongside (nothing is written to ns yet) so the
+    # gap names commit with the restore, all-or-nothing.
     prepared: dict[str, Any] = {}
+    backfill: list[tuple[str, Any]] = []
     revive_failed: list[dict[str, str]] = []
     for name, value in staged.items():
         try:
-            prepared[name] = _revive_with_live_globals(value, ns)
+            prepared[name] = _revive_with_live_globals(value, ns, backfill)
         except Exception as err:  # noqa: BLE001 - one broken revival must not abort the restore
             revive_failed.append({"name": name, "reason": f"{type(err).__name__}: {_safe_str(err)[:200]}"})
     result = {"restored": sorted(prepared), "failed": failed + revive_failed}
@@ -898,6 +938,10 @@ def _restore_state(
     try:
         for name, value in prepared.items():
             ns[name] = value
+        for name, value in backfill:
+            # Only genuine gaps: a live value or a restored name always wins.
+            if name not in ns:
+                ns[name] = value
         # Publish while still parked: a later KeyboardInterrupt into this task finds the committed result (see _handle_state).
         if committed is not None:
             committed.append(result)
