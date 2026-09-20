@@ -1,0 +1,1 @@
+- Cached kernel bootstrap validation for the process lifetime: sequential kernel starts reuse a validated venv (env + python-skill hashes + runtime identity, guarded by the bootstrap marker's stat identity) instead of re-hashing the runtime source and re-running the ready-check interpreter probe on every start. Failures drop the entry so the next start rebuilds.
