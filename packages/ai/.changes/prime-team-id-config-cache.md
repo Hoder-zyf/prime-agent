@@ -1,0 +1,1 @@
+- Prime Inference requests no longer re-read and re-parse the prime CLI config (~/.prime/config.json) on every request: the team id is cached per file stat identity and only re-read when the file changes, with PRIME_TEAM_ID keeping precedence.

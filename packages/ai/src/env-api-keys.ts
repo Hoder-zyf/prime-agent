@@ -1,4 +1,4 @@
-import type { existsSync, readFileSync } from "node:fs";
+import type { existsSync, readFileSync, statSync } from "node:fs";
 import type { homedir } from "node:os";
 import type { join } from "node:path";
 import type { KnownProvider } from "./types.js";
@@ -6,6 +6,7 @@ import type { KnownProvider } from "./types.js";
 // NEVER convert to top-level runtime imports - breaks browser/Vite builds
 let _existsSync: typeof existsSync | null = null;
 let _readFileSync: typeof readFileSync | null = null;
+let _statSync: typeof statSync | null = null;
 let _homedir: typeof homedir | null = null;
 let _join: typeof join | null = null;
 
@@ -20,6 +21,7 @@ if (typeof process !== "undefined" && (process.versions?.node || process.version
 	dynamicImport(NODE_FS_SPECIFIER).then((m) => {
 		_existsSync = (m as { existsSync: typeof existsSync }).existsSync;
 		_readFileSync = (m as { readFileSync: typeof readFileSync }).readFileSync;
+		_statSync = (m as { statSync: typeof statSync }).statSync;
 	});
 	dynamicImport(NODE_OS_SPECIFIER).then((m) => {
 		_homedir = (m as { homedir: typeof homedir }).homedir;
@@ -201,21 +203,51 @@ export function getEnvApiKey(provider: string): string | undefined {
 	return undefined;
 }
 
+/** Stat identity of the prime CLI config: any writer replaces the file and bumps its mtime, so equality means the parse is still current. */
+interface PrimeConfigIdentity {
+	dev: number;
+	ino: number;
+	size: number;
+	mtimeMs: number;
+}
+
+let primeConfigCache: { identity: PrimeConfigIdentity; teamId: string | undefined } | null = null;
+
 export function getPrimeTeamId(): string | undefined {
 	const fromEnv = process.env.PRIME_TEAM_ID || getProcEnv("PRIME_TEAM_ID");
 	if (fromEnv?.trim()) return fromEnv.trim();
 
-	if (!_existsSync || !_readFileSync || !_homedir || !_join) return undefined;
+	if (!_existsSync || !_readFileSync || !_statSync || !_homedir || !_join) return undefined;
 	const configPath = _join(_homedir(), ".prime", "config.json");
-	if (!_existsSync(configPath)) return undefined;
+	let identity: PrimeConfigIdentity;
+	try {
+		const stats = _statSync(configPath);
+		identity = { dev: stats.dev, ino: stats.ino, size: stats.size, mtimeMs: stats.mtimeMs };
+	} catch {
+		// No config file: nothing to cache, nothing to serve.
+		primeConfigCache = null;
+		return undefined;
+	}
+	const cached = primeConfigCache;
+	if (
+		cached &&
+		cached.identity.dev === identity.dev &&
+		cached.identity.ino === identity.ino &&
+		cached.identity.size === identity.size &&
+		cached.identity.mtimeMs === identity.mtimeMs
+	) {
+		return cached.teamId;
+	}
+	let teamId: string | undefined;
 	try {
 		const parsed = JSON.parse(_readFileSync(configPath, "utf-8")) as unknown;
 		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-			const teamId = (parsed as Record<string, unknown>).team_id;
-			if (typeof teamId === "string" && teamId.trim()) return teamId.trim();
+			const value = (parsed as Record<string, unknown>).team_id;
+			if (typeof value === "string" && value.trim()) teamId = value.trim();
 		}
 	} catch {
 		// Treat unreadable or malformed config as no configured team.
 	}
-	return undefined;
+	primeConfigCache = { identity, teamId };
+	return teamId;
 }
