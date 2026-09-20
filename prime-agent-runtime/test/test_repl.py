@@ -660,7 +660,7 @@ class ReplTest(unittest.TestCase):
             events = self.repl.execute("chk", "'In' in dir()")
             self.assertEqual(one(events, "result")["text"], "False")
 
-    def test_restore_revives_functions_with_live_globals(self):
+    def test_restore_revives_functions_with_live_globals_pr2471(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "state.dill")
             self.repl.execute("fn1", "G = 1\ndef reader():\n    return G\ndef prober():\n    return late")
