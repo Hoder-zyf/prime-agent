@@ -12884,13 +12884,19 @@ export class AgentSession {
 	/**
 	 * Resolve the user-configured backup model reference against the available
 	 * models. Unknown or unauthenticated references resolve to undefined: the
-	 * wait loop runs instead, and never surprises the user with a switch.
+	 * wait loop runs instead, and never surprises the user with a switch. A
+	 * run routed for images also rejects a text-only backup the same way: the
+	 * retry then stays on the routed model instead of serving the turn's
+	 * images to a model that would silently downgrade them to placeholders.
 	 */
 	private _resolveBackupModel(): Model<any> | undefined {
 		const reference = this.settingsManager.getProviderBackupModel();
 		if (!reference) return undefined;
 		const backupModel = findExactModelReferenceMatch(reference, this._modelRegistry.getAvailable());
 		if (!backupModel || !this._modelRegistry.hasConfiguredAuth(backupModel)) {
+			return undefined;
+		}
+		if (this.agent.modelOverride && !backupModel.input.includes("image")) {
 			return undefined;
 		}
 		return backupModel;

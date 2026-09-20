@@ -19,8 +19,19 @@ const SET = { imageModel: "claude-haiku-4-5" };
 const SET_BLOCKED = { imageModel: "claude-haiku-4-5", images: { blockImages: true } };
 const SET_UNUSABLE = { imageModel: "openai/gpt-5.4" };
 const SET_TEXTONLY = { imageModel: "deepseek/deepseek-v4-pro" };
+const RETRY = { enabled: true, maxRetries: 3, baseDelayMs: 1 };
+const SET_BACKUP_TEXT = { ...SET, providerBackupModel: "deepseek/deepseek-v4-pro", retry: RETRY };
+const SET_BACKUP_VISION = { ...SET, providerBackupModel: "claude-opus-4-7", retry: RETRY };
+const SERVED_IMAGE = ["claude-haiku-4-5", "claude-haiku-4-5"];
+const SERVED_BACKUP = ["claude-haiku-4-5", "claude-opus-4-7"];
+const transientFailure = (): AssistantMessage => ({
+	...assistantMsg(""),
+	stopReason: "error",
+	errorMessage: "overloaded_error",
+	diagnostics: [{ type: "provider_stream_failure", timestamp: Date.now(), details: { kind: "overloaded" } }],
+});
 
-// [name, settings, vision session model, attaches images, served model id, rejection]
+// [name, settings, vision session model, attaches images, served model ids, rejection]
 it.each([
 	["routes image turns to imageModel", SET, false, true, "claude-haiku-4-5", undefined],
 	["vision session model serves image turns", SET, true, true, "claude-opus-4-7", undefined],
@@ -29,6 +40,8 @@ it.each([
 	["refuses image turns without imageModel", {}, false, true, undefined, /does not accept image input/],
 	["refuses an unusable imageModel", SET_UNUSABLE, false, true, undefined, /could not be resolved/],
 	["refuses a text-only imageModel", SET_TEXTONLY, false, true, undefined, /could not be resolved/],
+	["skips a text-only backup for image turns", SET_BACKUP_TEXT, false, true, SERVED_IMAGE, undefined],
+	["image-capable backup serves the retry", SET_BACKUP_VISION, false, true, SERVED_BACKUP, undefined],
 	["cycling clears the routed override", SET, false, true, "claude-haiku-4-5", undefined, true],
 ])("%s", async (_name, settings, vision, images, served, reject, cycleAfter?: boolean) => {
 	const dir = mkdtempSync(join(tmpdir(), "pi-image-model-"));
@@ -45,7 +58,13 @@ it.each([
 				(e) => e.type === "done",
 				(e: any) => e.message,
 			);
-			stream.push({ type: "done", reason: "stop", message: assistantMsg("ok") });
+			// Rows listing a served sequence inject the transient failure that
+			// triggers the backup retry; the retry serves the next entry.
+			stream.push({
+				type: "done",
+				reason: "stop",
+				message: Array.isArray(served) && servedIds.length === 1 ? transientFailure() : assistantMsg("ok"),
+			});
 			return stream;
 		},
 	});
@@ -64,7 +83,7 @@ it.each([
 		const prompt = session.prompt("describe", images ? { images: [IMAGE] } : undefined);
 		if (reject) return await expect(prompt).rejects.toThrow(reject);
 		await prompt;
-		expect(servedIds).toEqual([served]);
+		expect(servedIds).toEqual(Array.isArray(served) ? served : [served]);
 		expect(session.model?.id).toBe(sessionModel.id);
 		if (!cycleAfter) return;
 		// The routed turn leaves its override behind; cycling must clear it so
