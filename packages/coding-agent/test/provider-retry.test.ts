@@ -1,8 +1,9 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
 	completeWithProviderRetry,
 	DEFAULT_PROVIDER_WAIT_POLICY,
+	isPermanentProviderFailureKind,
 	type ProviderWaitPolicy,
 	parseProviderResetMs,
 	providerRetryDelay,
@@ -12,7 +13,7 @@ import {
 	providerWaitPingDelay,
 } from "../src/core/provider-retry.js";
 
-function providerError(): AssistantMessage {
+function providerError(kind?: string): AssistantMessage {
 	return {
 		role: "assistant",
 		content: [],
@@ -30,6 +31,7 @@ function providerError(): AssistantMessage {
 		stopReason: "error",
 		errorMessage: "500 Internal Server Error",
 		timestamp: Date.now(),
+		diagnostics: kind ? [{ type: "provider_stream_failure", timestamp: Date.now(), details: { kind } }] : undefined,
 	};
 }
 
@@ -46,18 +48,15 @@ describe("completeWithProviderRetry", () => {
 		expect(result.stopReason).toBe("aborted");
 	});
 
-	it("makes a single attempt when the policy disables retries", async () => {
-		let attempts = 0;
-		const result = await completeWithProviderRetry(
-			async () => {
-				attempts++;
-				return providerError();
-			},
-			{ policy: { enabled: false, maxRetries: 3, baseDelayMs: 1, maxRetryDelayMs: 60_000 } },
-		);
-
-		expect(attempts).toBe(1);
+	it.each([
+		{ kind: undefined, policy: { enabled: false, maxRetries: 3, baseDelayMs: 1, maxRetryDelayMs: 60_000 } },
+		{ kind: "safety", policy: { enabled: true, maxRetries: 3, baseDelayMs: 1, maxRetryDelayMs: 60_000 } },
+	])("single attempt when retries are disabled or the failure is permanent", async ({ kind, policy }) => {
+		expect(isPermanentProviderFailureKind("safety", 0)).toBe(true);
+		const attempt = vi.fn(async () => providerError(kind));
+		const result = await completeWithProviderRetry(attempt, { policy });
 		expect(result.stopReason).toBe("error");
+		expect(attempt).toHaveBeenCalledTimes(1);
 	});
 
 	it("clamps uncapped server delays to Node's max timer instead of overflowing setTimeout", () => {
