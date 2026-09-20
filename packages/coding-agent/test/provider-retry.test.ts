@@ -51,7 +51,7 @@ describe("completeWithProviderRetry", () => {
 	it.each([
 		{ kind: undefined, policy: { enabled: false, maxRetries: 3, baseDelayMs: 1, maxRetryDelayMs: 60_000 } },
 		{ kind: "safety", policy: { enabled: true, maxRetries: 3, baseDelayMs: 1, maxRetryDelayMs: 60_000 } },
-	])("single attempt when retries are disabled or the failure is permanent", async ({ kind, policy }) => {
+	])("PR#2472: single attempt when retries are disabled or the failure is permanent", async ({ kind, policy }) => {
 		expect(isPermanentProviderFailureKind("safety", 0)).toBe(true);
 		const attempt = vi.fn(async () => providerError(kind));
 		const result = await completeWithProviderRetry(attempt, { policy });
