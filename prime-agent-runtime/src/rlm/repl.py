@@ -518,16 +518,6 @@ def _compile_cell(code: str, filename: str) -> tuple[list[types.CodeType], bool]
     """Compile a cell; a trailing expression compiles separately in eval mode."""
     linecache.cache[filename] = (len(code), None, code.splitlines(keepends=True), filename)
     tree = ast.parse(code, filename)
-    # The cell may (re)bind or delete top-level names, so their tracked sizes go
-    # stale the moment it settles; a stale "oversized" marker could wrongly prune
-    # a now-small variable. Requests run one at a time, so dropping here is
-    # equivalent to dropping when the cell finishes.
-    for stale in _names_bound_or_deleted(tree):
-        _name_sizes.pop(stale, None)
-    # A star import (only legal at module level) can rebind any public name:
-    # nothing is provable until the next dump re-measures it.
-    if any(isinstance(stmt, ast.ImportFrom) and "*" in {alias.name for alias in stmt.names} for stmt in tree.body):
-        _name_sizes.clear()
     trailing: ast.Expression | None = None
     if tree.body and isinstance(tree.body[-1], ast.Expr):
         trailing = ast.Expression(tree.body.pop().value)
@@ -658,73 +648,6 @@ class _CappedWriter:
         return size
 
 
-# Tracked serialized size of every snapshotted top-level name, refreshed by each
-# snapshot dump: the measured blob length, or the bitwise-complement marker ~cap
-# (negative) when a dump blew its cap. Lets prune-mode snapshots delete known
-# oversized variables without re-serializing them just to measure.
-#
-# Residual risk: in-place shrinking without rebinding (x.clear(), x[:] = []) and
-# dynamic rebinding (globals()[...], exec) defeat static invalidation, so a stale
-# marker can wrongly prune in the narrow window before the next snapshot refreshes
-# the entry - by which time the wrongly pruned value is small anyway.
-_name_sizes: dict[str, int] = {}
-
-
-def _tracked_proves_oversized(name: str, max_variable_bytes: int) -> bool:
-    """True when the tracked size already proves the value exceeds the cap.
-
-    A marker only proves oversize when the cap it blew was at least the
-    per-variable cap; a stale or small entry merely costs a re-measurement.
-    """
-    cached = _name_sizes.get(name)
-    if cached is None:
-        return False
-    return ~cached >= max_variable_bytes if cached < 0 else cached > max_variable_bytes
-
-
-def _names_bound_or_deleted(tree: ast.Module) -> set[str]:
-    """Top-level names a cell may (re)bind or delete, for tracked-size invalidation.
-
-    Walks module-level statements (loop/with/if/try bodies included) but skips
-    nested function/class/lambda scopes: their bindings never touch the module
-    namespace, and over-invalidating is safe while a missed rebinding is not.
-    The str-valued capture fields (match captures, ``except E as e``) carry no
-    ast.Name node, so they are collected from their own node types.
-    """
-    bound: set[str] = set()
-
-    def visit(node: ast.AST) -> None:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
-            return
-        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
-            bound.add(node.id)
-        elif isinstance(node, ast.Import):
-            for alias in node.names:
-                bound.add(alias.asname or alias.name.split(".")[0])
-        elif isinstance(node, ast.ImportFrom):
-            for alias in node.names:
-                bound.add(alias.asname or alias.name)
-        elif isinstance(node, ast.ExceptHandler) and node.name:
-            bound.add(node.name)
-        elif isinstance(node, ast.MatchAs) and node.name:
-            bound.add(node.name)
-        elif isinstance(node, ast.MatchStar) and node.name:
-            bound.add(node.name)
-        elif isinstance(node, ast.MatchMapping) and node.rest:
-            bound.add(node.rest)
-        for child in ast.iter_child_nodes(node):
-            visit(child)
-
-    for stmt in tree.body:
-        visit(stmt)
-    # A global declaration inside a nested scope still rebinds module names when
-    # called, and visit skips those subtrees: sweep the whole tree for them.
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Global):
-            bound.update(node.names)
-    return bound
-
-
 def _read_snapshot_records(fh: Any) -> dict[str, bytes]:
     """Parse a v2 payload's self-delimiting records, positioned after the magic.
 
@@ -826,31 +749,20 @@ def _snapshot_state(
                     if value is missing:
                         # A background thread deleted the name after the key listing.
                         skipped.append({"name": name, "reason": "deleted during snapshot"})
-                        _name_sizes.pop(name, None)
-                        continue
-                    if prune_oversized and _tracked_proves_oversized(name, max_variable_bytes):
-                        # A tracked size from an earlier dump proves it: prune without
-                        # paying another capped measurement serialization.
-                        skipped.append({"name": name, "reason": "exceeds per-variable snapshot size cap"})
-                        oversized.append(name)
                         continue
                     encoded = name.encode("utf-8")
                     budget = max_bytes - total - 12 - len(encoded)
                     # Prune mode measures at the full per-variable cap, so only that
-                    # cap decides pruned-ness; the aggregate budget then gates the write.
+                    # cap decides pruned-ness; the aggregate budget then gates the
+                    # write. A destructive prune always re-measures: only the current
+                    # value's size can prove it oversized, and in-place mutation
+                    # defeats any name-based tracking of an earlier dump.
                     limit = max_variable_bytes if prune_oversized else min(max_variable_bytes, budget)
                     buffer = io.BytesIO()
                     try:
                         dill.dump(value, _CappedWriter(buffer, limit))
                         blob = buffer.getvalue()
                     except _SnapshotSizeLimitExceeded:
-                        # The marker records the cap the dump blew. A negative limit
-                        # (exhausted aggregate budget) proves nothing: any dump blows
-                        # it, so drop any stale entry instead of storing junk.
-                        if limit >= 0:
-                            _name_sizes[name] = ~limit
-                        else:
-                            _name_sizes.pop(name, None)
                         if not prune_oversized and budget < max_variable_bytes:
                             skipped.append({"name": name, "reason": "exceeds aggregate snapshot size cap"})
                         else:
@@ -858,12 +770,10 @@ def _snapshot_state(
                             oversized.append(name)
                         continue
                     except Exception as err:  # noqa: BLE001 - one unpicklable name must not abort the snapshot
-                        _name_sizes.pop(name, None)
                         skipped.append({"name": name, "reason": f"{type(err).__name__}: {_safe_str(err)[:200]}"})
                         continue
                     if total + 12 + len(encoded) + len(blob) > max_bytes:
                         # Only reachable in prune mode, where the measurement cap ignores the budget.
-                        _name_sizes[name] = len(blob)
                         skipped.append({"name": name, "reason": "exceeds aggregate snapshot size cap"})
                         continue
                     fh.write(len(encoded).to_bytes(4, "little"))
@@ -872,7 +782,6 @@ def _snapshot_state(
                     fh.write(blob)
                     total += 12 + len(encoded) + len(blob)
                     saved.append(name)
-                    _name_sizes[name] = len(blob)
                 saved.sort()
                 pruned = sorted(name for name in oversized if name in ns) if prune_oversized else []
                 manifest = {
@@ -909,7 +818,6 @@ def _snapshot_state(
             return {"error": f"manifest write failed: {err}"}
         for name in pruned:
             ns.pop(name, None)
-            _name_sizes.pop(name, None)
         result = {"saved": saved, "skipped": skipped, "pruned": pruned, "bytes": total}
         # Publish while still parked: a later KeyboardInterrupt into this task finds the committed result (see _handle_state).
         if committed is not None:
@@ -963,9 +871,6 @@ def _restore_state(
             staged[name] = dill.loads(blob)
         except Exception as err:  # noqa: BLE001 - revive every other name regardless
             failed.append({"name": name, "reason": f"{type(err).__name__}: {_safe_str(err)[:200]}"})
-        else:
-            # Seed the tracked-size cache: the blob length is a complete measurement.
-            _name_sizes[name] = len(blob)
     result = {"restored": sorted(staged), "failed": failed}
     # Park SIGINT across the whole apply so it is all-or-nothing; the parked interrupt is consumed by the commit (as in snapshot).
     previous = signal.signal(signal.SIGINT, lambda signum, frame: None)

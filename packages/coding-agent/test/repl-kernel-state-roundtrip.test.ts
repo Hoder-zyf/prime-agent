@@ -205,8 +205,8 @@ describeIfKernel("repl kernel state snapshot round-trip (real runtime)", { tags:
 		try {
 			expect((await reader.restoreState())?.restored).toContain("restored_var");
 			vi.useFakeTimers();
-			// Production order: the bootstrap-like execute schedules the debounced
-			// auto-snapshot, then the arm marks the restored namespace as fresh.
+			// Production order: the execute schedules the debounced auto-snapshot,
+			// then the arm marks the restored namespace as fresh.
 			await reader.execute("pass");
 			reader.markRestoredNamespaceFresh();
 			const statBefore = statSync(manifestPath);
@@ -223,8 +223,8 @@ describeIfKernel("repl kernel state snapshot round-trip (real runtime)", { tags:
 			const manifestAfter = JSON.parse(readFileSync(manifestPath, "utf8")) as { savedNames: string[] };
 			expect(manifestAfter.savedNames).toEqual(expect.arrayContaining(["restored_var", "user_var"]));
 
-			// A failed or timed-out restore must arm too: the debounced auto-snapshot
-			// would otherwise clobber the on-disk copy with a skills-only payload.
+			// A failed restore must arm too, or the debounced auto-snapshot clobbers
+			// the on-disk copy with a skills-only payload.
 			writeFileSync(snapshotPath, "not-a-snapshot");
 			expect(await reader.restoreState()).toBeNull();
 			await reader.execute("pass");
@@ -232,14 +232,32 @@ describeIfKernel("repl kernel state snapshot round-trip (real runtime)", { tags:
 			await vi.advanceTimersByTimeAsync(300);
 			await reader.listNamespaceNames();
 			expect(readFileSync(snapshotPath, "utf8")).toBe("not-a-snapshot");
-			await reader.execute("user_var2 = 9");
-			await vi.advanceTimersByTimeAsync(300);
-			await reader.listNamespaceNames();
-			const manifest2 = JSON.parse(readFileSync(manifestPath, "utf8")) as { savedNames: string[] };
-			expect(manifest2.savedNames).toContain("user_var2");
 		} finally {
 			vi.useRealTimers();
 			await reader.shutdown({ snapshot: true, drainHostRequests: true });
+		}
+	});
+
+	it("keeps the on-disk payload when a restore failed or timed out and the kernel shuts down (PR 2478)", async () => {
+		const failDir = mkdtempSync(join(tmpdir(), "prime-agent-repl-restore-fail-"));
+		const failPath = join(failDir, "session.dill");
+		const manager = new ReplKernelManager({
+			python: python as string,
+			cwd: failDir,
+			snapshot: { path: failPath, manifestPath: join(failDir, "session.json") },
+		});
+		try {
+			// An unloadable payload fails into the same performRestore branch a
+			// timed-out restore takes: the namespace never got the saved state.
+			writeFileSync(failPath, "not-a-snapshot");
+			expect(await manager.restoreState()).toBeNull();
+			// The final flush must not overwrite the on-disk payload with an empty
+			// snapshot.
+			await manager.shutdown({ snapshot: true, drainHostRequests: true });
+			expect(readFileSync(failPath, "utf8")).toBe("not-a-snapshot");
+			expect(existsSync(join(failDir, "session.json"))).toBe(false);
+		} finally {
+			rmSync(failDir, { recursive: true, force: true });
 		}
 	});
 });

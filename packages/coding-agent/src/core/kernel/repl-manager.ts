@@ -52,8 +52,8 @@ import {
 	parseAttachmentDisplay,
 	parseDiffDisplay,
 	parseSentAgentMessage,
-	raceStartupWithAbort,
 	RESTORE_EXECUTION_TIMEOUT_MS,
+	raceStartupWithAbort,
 	SNAPSHOT_EXECUTION_TIMEOUT_MS,
 } from "./shared.js";
 import {
@@ -236,7 +236,10 @@ export class ReplKernelManager {
 	/** Manifest stat captured before the last non-repair restore attempt; arming basis for the skip. */
 	private restoredManifestStat?: { mtimeMs: number; size: number } | null;
 	/** Armed one-shot skip of the redundant post-restore auto-snapshot. */
-	private restoredNamespaceSkip?: { manifestStat: { mtimeMs: number; size: number } | null; completedExecutions: number };
+	private restoredNamespaceSkip?: {
+		manifestStat: { mtimeMs: number; size: number } | null;
+		completedExecutions: number;
+	};
 	private rebootstrapPromise?: Promise<boolean>;
 	private teardownInFlight = 0;
 
@@ -1601,8 +1604,10 @@ export class ReplKernelManager {
 		const cfg = this.options.snapshot;
 		if (!cfg) return null;
 		// Stat before the attempt: a restore never touches the manifest, and a failed
-		// or timed-out restore must still leave the stat for the arming below.
-		this.restoredManifestStat = protocolRepair ? undefined : manifestStatOf(cfg.manifestPath);
+		// or timed-out restore must still leave the stat for the arming below. A
+		// repair attempt (like the reprovision retry after a failed first restore)
+		// keeps the non-repair stat as the arming basis.
+		if (!protocolRepair) this.restoredManifestStat = manifestStatOf(cfg.manifestPath);
 		try {
 			const r = await this.enqueueRequest(
 				{ type: "restore", path: cfg.path },
@@ -1614,6 +1619,10 @@ export class ReplKernelManager {
 				this.appendKernelDiagnostic(
 					`state restore ${r.status === "aborted" ? "timed out" : "failed"}: ${r.error?.evalue ?? r.stderr}`,
 				);
+				// The namespace never received the saved state, so the restore stays
+				// pending: the dispose guard must keep treating the on-disk payload as
+				// the fresher copy, and the next request gets one bounded retry.
+				if (!protocolRepair) this.pendingRestore = true;
 				return null;
 			}
 			this.pendingRestore = false;
@@ -1624,6 +1633,7 @@ export class ReplKernelManager {
 			};
 		} catch (error) {
 			this.appendKernelDiagnostic(`state restore error: ${errorMessage(error)}`);
+			if (!protocolRepair) this.pendingRestore = true;
 			return null;
 		}
 	}
