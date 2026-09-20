@@ -819,19 +819,35 @@ def _snapshot_state(
 
 
 def _revive_with_live_globals(value: Any, ns: dict[str, Any]) -> Any:
-    """Rebind dill's by-value function revivals onto the live namespace.
+    """Rebind restored __main__ callables onto the live namespace.
 
-    dill re-creates a saved __main__ function with a private __globals__ dict
-    frozen at snapshot time, so the revived callable keeps reading stale values
-    after later cells rewrite the namespace. Rebuilding it against ns replaces
-    only __globals__ and keeps the rest of dill's revival fidelity: docstring,
+    A saved __main__ function is rebuilt with ns as its __globals__ so later
+    cells read live values, keeping dill's other revival fidelity: docstring,
     keyword-only defaults, annotations, qualname, module, attribute dict.
-    Everything dill revived by reference (imported functions, classes, partials)
-    passes through untouched, keeping its own module's globals.
+    Names its revival globals carry that ns lacks (private exec dicts,
+    snapshot-pruned names) are backfilled into ns with their last-known
+    values; the live ns always wins. A functools.partial wrapping such a
+    function is rebuilt around the revived function; everything else — dill's
+    by-reference revivals like imported functions, or by-value user __main__
+    classes keeping dill's own revived globals — passes through untouched.
     """
+    import functools
+
+    if isinstance(value, functools.partial):
+        # Revive the wrapped callable when it is a __main__ function (nested
+        # partials recurse); a partial of anything else passes through.
+        rebuilt = _revive_with_live_globals(value.func, ns)
+        if rebuilt is value.func:
+            return value
+        return functools.partial(rebuilt, *value.args, **value.keywords)
     if not isinstance(value, types.FunctionType) or value.__module__ != "__main__":
         return value
     rebound = types.FunctionType(value.__code__, ns, value.__name__, value.__defaults__, value.__closure__)
+    # Backfill only what ns is missing (never clobber live values) and skip
+    # module machinery dunders such as __builtins__ and __name__.
+    for name, dep in value.__globals__.items():
+        if name not in ns and not (name.startswith("__") and name.endswith("__")):
+            ns[name] = dep
     rebound.__doc__ = value.__doc__
     rebound.__kwdefaults__ = value.__kwdefaults__
     rebound.__dict__.update(value.__dict__)
@@ -867,12 +883,21 @@ def _restore_state(
             staged[name] = dill.loads(blob)
         except Exception as err:  # noqa: BLE001 - revive every other name regardless
             failed.append({"name": name, "reason": f"{type(err).__name__}: {_safe_str(err)[:200]}"})
-    result = {"restored": sorted(staged), "failed": failed}
+    # Revive every staged name before parking: a revival failure must never
+    # abort the apply loop halfway and leave the namespace half old, half new.
+    prepared: dict[str, Any] = {}
+    revive_failed: list[dict[str, str]] = []
+    for name, value in staged.items():
+        try:
+            prepared[name] = _revive_with_live_globals(value, ns)
+        except Exception as err:  # noqa: BLE001 - one broken revival must not abort the restore
+            revive_failed.append({"name": name, "reason": f"{type(err).__name__}: {_safe_str(err)[:200]}"})
+    result = {"restored": sorted(prepared), "failed": failed + revive_failed}
     # Park SIGINT across the whole apply so it is all-or-nothing; the parked interrupt is consumed by the commit (as in snapshot).
     previous = signal.signal(signal.SIGINT, lambda signum, frame: None)
     try:
-        for name, value in staged.items():
-            ns[name] = _revive_with_live_globals(value, ns)
+        for name, value in prepared.items():
+            ns[name] = value
         # Publish while still parked: a later KeyboardInterrupt into this task finds the committed result (see _handle_state).
         if committed is not None:
             committed.append(result)
