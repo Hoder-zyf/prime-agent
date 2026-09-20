@@ -847,8 +847,9 @@ function normalizeMessageContent(content: string | (TextContent | ImageContent)[
  * Whether a delivered message attaches image content. Used to route
  * image-carrying turns off session models without image input.
  */
-function messageCarriesImages(message: QueuedAgentMessage): boolean {
-	return Array.isArray(message.content) && message.content.some((part) => part.type === "image");
+function messageCarriesImages(message: QueuedAgentMessage | AgentMessage): boolean {
+	const content = (message as { content?: unknown }).content;
+	return Array.isArray(content) && content.some((part: { type?: string }) => part?.type === "image");
 }
 
 function queuedAgentMessagePreview(action: QueuedSessionAction): string {
@@ -2535,12 +2536,15 @@ export class AgentSession {
 	 * re-evaluates it, so later image-free turns return to the session model.
 	 * A missing session model is reported by _validateCanStartAgentRun.
 	 */
-	private _imageModelOverrideForTurns(turns: SessionAction<PreparedTurnPayload>[]): AgentModelOverride | undefined {
+	private _imageModelOverrideForTurns(
+		turns: SessionAction<PreparedTurnPayload>[],
+		extraMessages: AgentMessage[] = [],
+	): AgentModelOverride | undefined {
 		const sessionModel = this.model;
 		if (!sessionModel) return undefined;
-		const carriesImages = turns.some((action) =>
-			action.payload.records.some((record) => messageCarriesImages(record.message)),
-		);
+		const carriesImages =
+			extraMessages.some((message) => messageCarriesImages(message)) ||
+			turns.some((action) => action.payload.records.some((record) => messageCarriesImages(record.message)));
 		if (!carriesImages) return undefined;
 		return resolveImageModelOverride({
 			sessionModel,
@@ -7044,6 +7048,10 @@ export class AgentSession {
 					for (const action of turns) transitionSessionAction(action, { state: "committing" });
 					this._notifySessionInputCheckpointChange();
 					this._emitQueueUpdate();
+					// Re-evaluate image routing for the exact message set being sent:
+					// before_agent_start injections land after the earlier per-turn
+					// decision and may carry images the session model cannot serve.
+					this.agent.modelOverride = this._imageModelOverrideForTurns(turns, preparedMessages);
 					return turns.some((action) => action.suppressAutonomousContinuation)
 						? this._runWithAutonomousContinuationSuppressed(() => this.agent.prompt(preparedMessages))
 						: this.agent.prompt(preparedMessages);
