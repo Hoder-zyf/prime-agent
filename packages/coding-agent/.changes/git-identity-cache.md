@@ -1,0 +1,1 @@
+- Reduced git-state capture cost: per-turn captures now run one async git invocation instead of three synchronous spawns, branches and repo URLs come from files and a per-cwd cache, and captures are skipped entirely while no tool has run since the last one. Session headers and git_state entries keep the same format.

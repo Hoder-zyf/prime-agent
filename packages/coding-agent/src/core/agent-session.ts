@@ -4486,11 +4486,11 @@ export class AgentSession {
 	private async _emitExtensionEvent(event: AgentEvent): Promise<void> {
 		if (event.type === "agent_start") {
 			this._turnIndex = 0;
-			this.sessionManager.recordGitStateIfChanged();
+			await this.sessionManager.recordGitStateIfChanged();
 			await this._extensionRunner.emit({ type: "agent_start" });
 		} else if (event.type === "agent_end") {
 			// Also capture at end of turn so commits made during the run (e.g. via a bash tool) land.
-			this.sessionManager.recordGitStateIfChanged();
+			await this.sessionManager.recordGitStateIfChanged();
 			await this._extensionRunner.emit({
 				type: "agent_end",
 				messages: event.messages,
