@@ -289,10 +289,10 @@ interface ChildNodeCacheEntry {
  * that work. Entries are reused only while their recorded stats still match
  * disk, so appends, compaction rewrites, renames, deletions, and new files
  * all force a re-parse. Hit validation covers the dir's own session file plus
- * one level of nested child dirs; deeper descendants rely on the invariant
- * that a session file only changes while its session is open or resident in
- * memory, and open or resident descendants are served from their live
- * sessions instead of this cache — a disk subtree served from a hit is static.
+ * the immediate nested child dirs, and each hit re-derives its children
+ * through this same per-level cache, so deeper descendants re-validate too: a
+ * changed descendant rebuilds only its own level while unchanged ones are
+ * the same node objects.
  */
 const childNodeCache = new Map<string, ChildNodeCacheEntry>();
 /** Insertion-order cap so a long-lived daemon cannot accumulate entries. */
@@ -377,7 +377,20 @@ export function loadContextTreeChildFromDisk(
 		sameChildFiles(cached.childFiles, childFiles) &&
 		resolvesToSameContextWindow(cached, resolveContextWindow)
 	) {
-		return cached.node;
+		const children: ContextTreeNode[] = [];
+		for (const grandchildDir of childFiles.keys()) {
+			const childNode = loadContextTreeChildFromDisk(grandchildDir, resolveContextWindow);
+			if (childNode) {
+				children.push(childNode);
+			}
+		}
+		let changed = children.length !== cached.node.children.length;
+		for (let i = 0; !changed && i < children.length; i++) {
+			if (children[i] !== cached.node.children[i]) {
+				changed = true;
+			}
+		}
+		return changed ? { ...cached.node, children } : cached.node;
 	}
 	return buildContextTreeChildFromDisk(childSessionDir, file, childFiles, resolveContextWindow);
 }

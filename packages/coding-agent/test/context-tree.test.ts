@@ -383,6 +383,22 @@ describe("child node cache", () => {
 		expect(secondParent.children[1]).toBe(firstParent.children[1]);
 	});
 
+	it("2477: revalidates deeper descendants on a cache hit", () => {
+		const rlmDir = makeTempDir();
+		const childDir = join(rlmDir, "sub-cache0002");
+		const grandchildDir = join(childDir, "sub-cache0003");
+		const deepDir = join(grandchildDir, "sub-cache0004");
+		writeChildSession(childDir, "parent work", createUsage(100, 10, 0.01));
+		writeChildSession(grandchildDir, "middle work", createUsage(50, 5, 0.005));
+		const deep = writeChildSession(deepDir, "deep work", createUsage(80, 8, 0.008));
+		loadContextTreeChildrenFromDisk(rlmDir, resolveContextWindow);
+		// The deepest session is resumed independently: only its file changes,
+		// so every level above it is a cache hit.
+		deep.sessionManager.appendMessage(createAssistantMessage("more", createUsage(400, 40, 0.04)));
+		const second = loadContextTreeChildrenFromDisk(rlmDir, resolveContextWindow);
+		expect(second[0].children[0].children[0].ownUsage.input).toBe(480);
+	});
+
 	it("picks up a grandchild whose session file appears after the parent was cached", () => {
 		const rlmDir = makeTempDir();
 		const childDir = join(rlmDir, "sub-new00001");
