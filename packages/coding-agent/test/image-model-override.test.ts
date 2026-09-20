@@ -22,6 +22,7 @@ const SET_TEXTONLY = { imageModel: "deepseek/deepseek-v4-pro" };
 const RETRY = { enabled: true, maxRetries: 3, baseDelayMs: 1 };
 const SET_BACKUP_TEXT = { ...SET, providerBackupModel: "deepseek/deepseek-v4-pro", retry: RETRY };
 const SET_BACKUP_VISION = { ...SET, providerBackupModel: "claude-opus-4-7", retry: RETRY };
+const SET_BACKUP_SAME = { ...SET, providerBackupModel: "claude-haiku-4-5", retry: RETRY };
 const SERVED_IMAGE = ["claude-haiku-4-5", "claude-haiku-4-5"];
 const SERVED_BACKUP = ["claude-haiku-4-5", "claude-opus-4-7"];
 const transientFailure = (): AssistantMessage => ({
@@ -42,29 +43,30 @@ it.each([
 	["refuses a text-only imageModel", SET_TEXTONLY, false, true, undefined, /could not be resolved/],
 	["skips a text-only backup for image turns", SET_BACKUP_TEXT, false, true, SERVED_IMAGE, undefined],
 	["image-capable backup serves the retry", SET_BACKUP_VISION, false, true, SERVED_BACKUP, undefined],
+	["duplicate backup skips the no-op switch", SET_BACKUP_SAME, false, true, SERVED_IMAGE, undefined],
+	["cycling mid-stream keeps routing", SET, false, true, SERVED_IMAGE, undefined, undefined, true],
 	["cycling clears the routed override", SET, false, true, "claude-haiku-4-5", undefined, true],
-])("%s", async (_name, settings, vision, images, served, reject, cycleAfter?: boolean) => {
+])("%s", async (_name, settings, vision, images, served, reject, cycleAfter?: boolean, cycleMidStream?: boolean) => {
 	const dir = mkdtempSync(join(tmpdir(), "pi-image-model-"));
 	writeFileSync(join(dir, "settings.json"), JSON.stringify(settings));
 	const base = getModel("anthropic", "claude-opus-4-7")!;
 	const sessionModel = (vision ? base : { ...base, id: "claude-opus-4-7-text-only", input: ["text"] }) as typeof base;
 	const servedIds: string[] = [];
+	let cycleMidStreamHook: (() => void) | undefined;
 	const agent = new Agent({
 		getApiKey: () => "test-key",
 		initialState: { model: sessionModel, systemPrompt: "Test", tools: [] },
 		streamFn: (model) => {
 			servedIds.push(model.id);
+			if (cycleMidStream && servedIds.length === 1) cycleMidStreamHook?.();
 			const stream = new EventStream<AssistantMessageEvent, AssistantMessage>(
 				(e) => e.type === "done",
 				(e: any) => e.message,
 			);
 			// Rows listing a served sequence inject the transient failure that
 			// triggers the backup retry; the retry serves the next entry.
-			stream.push({
-				type: "done",
-				reason: "stop",
-				message: Array.isArray(served) && servedIds.length === 1 ? transientFailure() : assistantMsg("ok"),
-			});
+			const message = Array.isArray(served) && servedIds.length === 1 ? transientFailure() : assistantMsg("ok");
+			stream.push({ type: "done", reason: "stop", message });
 			return stream;
 		},
 	});
@@ -79,12 +81,19 @@ it.each([
 		modelRegistry: ModelRegistry.create(auth, dir),
 		resourceLoader: createTestResourceLoader(),
 	});
+	cycleMidStreamHook = () => void session.cycleModel("forward", { waitForExtensions: false });
+	const backupSwitches: string[] = [];
+	session.subscribe((event) => {
+		if (event.type === "auto_retry_start" && event.reason === "backup") backupSwitches.push(event.reason);
+	});
 	try {
 		const prompt = session.prompt("describe", images ? { images: [IMAGE] } : undefined);
 		if (reject) return await expect(prompt).rejects.toThrow(reject);
 		await prompt;
 		expect(servedIds).toEqual(Array.isArray(served) ? served : [served]);
-		expect(session.model?.id).toBe(sessionModel.id);
+		expect(backupSwitches).toEqual(Array.isArray(served) && served[1] !== served[0] ? ["backup"] : []);
+		if (cycleMidStream) expect(session.model?.id).not.toBe(sessionModel.id);
+		else expect(session.model?.id).toBe(sessionModel.id);
 		if (!cycleAfter) return;
 		// The routed turn leaves its override behind; cycling must clear it so
 		// the selection wins over later continues, retries, and compaction.

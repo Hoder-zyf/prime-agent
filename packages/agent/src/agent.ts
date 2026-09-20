@@ -171,6 +171,8 @@ type ActiveRun = {
 	promise: Promise<void>;
 	resolve: () => void;
 	abortController: AbortController;
+	/** Model serving the run when it started; failures stay attributed to it. */
+	model: Model<any>;
 };
 
 /** Why {@link Agent.continue} refused to start a continuation. */
@@ -518,7 +520,12 @@ export class Agent {
 		const promise = new Promise<void>((resolve) => {
 			resolvePromise = resolve;
 		});
-		this.activeRun = { promise, resolve: resolvePromise, abortController };
+		this.activeRun = {
+			promise,
+			resolve: resolvePromise,
+			abortController,
+			model: this.modelOverride?.model ?? this._state.model,
+		};
 
 		this._state.isStreaming = true;
 		this._state.streamingMessage = undefined;
@@ -534,9 +541,10 @@ export class Agent {
 	}
 
 	private async handleRunFailure(error: unknown, aborted: boolean): Promise<void> {
-		// The override model served the run when one was routed, so failures are
-		// tagged with it rather than the session model.
-		const runModel = this.modelOverride?.model ?? this._state.model;
+		// The model that served the run when it started tags its failures: a
+		// routed run keeps the override, and even a mid-run override change
+		// cannot re-attribute an in-flight request to a model that never saw it.
+		const runModel = this.activeRun?.model ?? this.modelOverride?.model ?? this._state.model;
 		const failureMessage = {
 			role: "assistant",
 			content: [{ type: "text", text: "" }],

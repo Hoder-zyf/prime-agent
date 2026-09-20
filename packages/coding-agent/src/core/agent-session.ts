@@ -2565,6 +2565,29 @@ export class AgentSession {
 	}
 
 	/**
+	 * Whether a dispatched turn is still in flight: streaming, retrying with
+	 * backoff, or compacting before a continuation. Model selection during
+	 * any of these must not tear down a routed run's override, or the run's
+	 * retries, continuations, and failure attribution would leave the
+	 * image-capable model mid-turn.
+	 */
+	private get _hasActiveTurnLifecycle(): boolean {
+		return this.isStreaming || this.isRetrying || this.isCompacting;
+	}
+
+	/**
+	 * An explicit selection wins over image-model routing still lingering from
+	 * the last dispatched turn, but not over the model already serving an
+	 * active run. Cycling or switching mid-stream keeps the routed override
+	 * until the turn settles; the next dispatch re-evaluates the routing
+	 * against the new selection.
+	 */
+	private _clearModelOverrideWhenIdle(): void {
+		if (this._hasActiveTurnLifecycle) return;
+		this.agent.modelOverride = undefined;
+	}
+
+	/**
 	 * Goals are pursued through the kernel goal skill, so the only tool the
 	 * model needs is ipython. Force-activate it (including into a live
 	 * continuation context) so the model can always reach `goal.complete()`.
@@ -8084,9 +8107,7 @@ export class AgentSession {
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
 		const serviceTier = this._getServiceTierForModelSwitch();
 		this.agent.state.model = model;
-		// An explicit selection wins over any image-model routing still lingering
-		// from the last dispatched turn.
-		this.agent.modelOverride = undefined;
+		this._clearModelOverrideWhenIdle();
 		this.sessionManager.appendModelChange(model.provider, model.id);
 		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
 
@@ -8154,9 +8175,7 @@ export class AgentSession {
 		const serviceTier = this._getServiceTierForModelSwitch();
 
 		this.agent.state.model = next.model;
-		// An explicit selection wins over any image-model routing still lingering
-		// from the last dispatched turn.
-		this.agent.modelOverride = undefined;
+		this._clearModelOverrideWhenIdle();
 		this.sessionManager.appendModelChange(next.model.provider, next.model.id);
 		this.settingsManager.setDefaultModelAndProvider(next.model.provider, next.model.id);
 
@@ -8196,9 +8215,7 @@ export class AgentSession {
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
 		const serviceTier = this._getServiceTierForModelSwitch();
 		this.agent.state.model = nextModel;
-		// An explicit selection wins over any image-model routing still lingering
-		// from the last dispatched turn.
-		this.agent.modelOverride = undefined;
+		this._clearModelOverrideWhenIdle();
 		this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
 		this.settingsManager.setDefaultModelAndProvider(nextModel.provider, nextModel.id);
 
@@ -12726,10 +12743,13 @@ export class AgentSession {
 
 		// User-defined backup model (settings.providerBackupModel, default none):
 		// route the failed turn to the backup instead of waiting while the
-		// primary is quota-blocked or its provider is unavailable.
+		// primary is quota-blocked or its provider is unavailable. The guard
+		// compares against the model serving the run, so a backup equal to a
+		// routed turn's image model is recognized as the duplicate it is instead
+		// of reporting a no-op backup switch with a zero-delay retry.
 		if (waitClass !== "permanent") {
 			const backupModel = this._resolveBackupModel();
-			if (backupModel && !modelsAreEqual(this.model, backupModel)) {
+			if (backupModel && !modelsAreEqual(this._runModel(), backupModel)) {
 				return this._handleBackupModelRetry(message, options, backupModel);
 			}
 		}
