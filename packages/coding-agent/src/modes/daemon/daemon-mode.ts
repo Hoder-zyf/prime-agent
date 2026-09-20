@@ -145,7 +145,12 @@ import {
 } from "./agent-roster.js";
 import { createCompactAssistantDelta } from "./compact-session-stream.js";
 import { filterClientEnv, withClientEnv } from "./daemon-client-env.js";
-import { deserializeDaemonError, serializeDaemonError } from "./daemon-errors.js";
+import {
+	deserializeDaemonError,
+	serializeDaemonError,
+	UPDATE_RESTART_PREPARING_ERROR_INFO,
+	UPDATE_RESTART_PREPARING_MESSAGE,
+} from "./daemon-errors.js";
 import { bindActiveSessionState } from "./daemon-extension-binding.js";
 import {
 	collectDaemonLaunchEnv,
@@ -186,6 +191,7 @@ import {
 	inactiveLifecycleForSession,
 	type SessionSummary,
 	scheduledJobRegistrations,
+	sessionDisplayLabels,
 	summaryForActiveSession,
 } from "./daemon-session-list.js";
 import { DaemonSessionSummarizer } from "./daemon-session-summarizer.js";
@@ -305,6 +311,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"agent_messages_resume",
 	"agent_messages_clear",
 	"abort",
+	"abort_and_send_queued",
 	"start_side_question",
 	"abort_side_question",
 	"execute_bash",
@@ -575,6 +582,15 @@ export class AgentDaemon {
 	private readonly pendingSessionNames = new Set<string>();
 	private restoreActiveSessionId: string | undefined;
 	private supervisorMonitorTimer?: ReturnType<typeof setTimeout>;
+	/**
+	 * Settles when the armed supervisor availability check has run to completion
+	 * (including the reschedule it performs) or has been cancelled. The check is
+	 * a real async chain started from a timer callback, so this is the only way
+	 * an observer can tell that the monitor reached a steady state; the daemon
+	 * supervisor monitor tests await it instead of polling a timer loop.
+	 */
+	supervisorAvailabilityCheckSettled?: Promise<void>;
+	private settleArmedSupervisorAvailabilityCheck?: () => void;
 	private supervisorFenceTimer?: ReturnType<typeof setTimeout>;
 	private supervisorLaunchInProgress = false;
 	private supervisorAbsentSince?: number;
@@ -601,6 +617,7 @@ export class AgentDaemon {
 	private readonly recoveryJournal?: WorkerRecoveryJournal;
 	private readonly rosterReporter: WorkerRosterReporterState = {
 		lastComposed: new Map(),
+		lastComposedSource: new Map(),
 		lastComposedJson: new Map(),
 		queuedChildren: new Map(),
 		removedAgentIds: new Map(),
@@ -757,17 +774,36 @@ export class AgentDaemon {
 		if (this.shuttingDown || this.hasAuthenticatedSupervisorConnection()) {
 			return;
 		}
-		if (this.supervisorMonitorTimer) {
-			clearTimeout(this.supervisorMonitorTimer);
-		}
+		this.cancelArmedSupervisorAvailabilityCheck();
+		let settle: () => void = () => undefined;
+		this.supervisorAvailabilityCheckSettled = new Promise<void>((resolveSettled) => {
+			settle = resolveSettled;
+		});
+		this.settleArmedSupervisorAvailabilityCheck = settle;
 		this.supervisorMonitorTimer = setTimeout(() => {
 			this.supervisorMonitorTimer = undefined;
-			void this.checkSupervisorAvailability(supervisorSocketPath).catch(() => {
-				if (!this.shuttingDown && !this.hasAuthenticatedSupervisorConnection()) {
-					this.scheduleSupervisorAvailabilityCheck(supervisorSocketPath, 5000);
-				}
-			});
+			// The check owns its settle from here on, so a reschedule started
+			// inside it installs a fresh one instead of resolving this one early.
+			this.settleArmedSupervisorAvailabilityCheck = undefined;
+			void this.checkSupervisorAvailability(supervisorSocketPath)
+				.catch(() => {
+					if (!this.shuttingDown && !this.hasAuthenticatedSupervisorConnection()) {
+						this.scheduleSupervisorAvailabilityCheck(supervisorSocketPath, 5000);
+					}
+				})
+				.finally(settle);
 		}, delayMs);
+	}
+
+	/** Disarms a pending check and settles it, since it will never run. */
+	private cancelArmedSupervisorAvailabilityCheck(): void {
+		if (this.supervisorMonitorTimer) {
+			clearTimeout(this.supervisorMonitorTimer);
+			this.supervisorMonitorTimer = undefined;
+		}
+		const settle = this.settleArmedSupervisorAvailabilityCheck;
+		this.settleArmedSupervisorAvailabilityCheck = undefined;
+		settle?.();
 	}
 
 	private async checkSupervisorAvailability(supervisorSocketPath: string): Promise<void> {
@@ -868,10 +904,7 @@ export class AgentDaemon {
 	}
 
 	private clearSupervisorAvailabilityCheck(): void {
-		if (this.supervisorMonitorTimer) {
-			clearTimeout(this.supervisorMonitorTimer);
-			this.supervisorMonitorTimer = undefined;
-		}
+		this.cancelArmedSupervisorAvailabilityCheck();
 		if (this.supervisorFenceTimer) {
 			clearTimeout(this.supervisorFenceTimer);
 			this.supervisorFenceTimer = undefined;
@@ -2296,11 +2329,13 @@ export class AgentDaemon {
 			.filter((job) => isHeartbeatCronJob(job) && (job.status === "active" || job.status === "paused"))
 			.map((job) => {
 				const state = this.sessions.get(job.activeSessionId);
-				const summary = state ? summaryForActiveSession(state) : undefined;
+				// Only the session's display labels are needed; a full summary compose
+				// would re-walk the transcript once per heartbeat job on every poll.
+				const labels = state ? sessionDisplayLabels(state) : undefined;
 				return {
 					job,
-					...(summary?.sessionName ? { sessionName: summary.sessionName } : {}),
-					...(summary?.firstMessage ? { firstMessage: summary.firstMessage } : {}),
+					...(labels?.sessionName ? { sessionName: labels.sessionName } : {}),
+					...(labels?.firstMessage ? { firstMessage: labels.firstMessage } : {}),
 				};
 			});
 	}
@@ -2861,6 +2896,33 @@ export class AgentDaemon {
 	}
 
 	private async createRlmSubagentRuntime(
+		parentState: ActiveSessionState,
+		options: CreateRlmSubagentRuntimeOptions,
+	): Promise<AgentSessionRuntime> {
+		// The sibling name is held under a daemon-wide reservation for the
+		// whole admission and re-asserted at this boundary, so a same-name
+		// sibling that lands mid-admission fails closed before the durable
+		// ledger edge is appended.
+		const nameReservation = {
+			name: options.sessionName,
+			depth: options.rlmDepth,
+			parentSessionId: options.parentSession.sessionId,
+			...(options.parentSession.sessionFile ? { parentSessionPath: options.parentSession.sessionFile } : {}),
+		};
+		const reservationKey = sessionNameReservationKey(nameReservation);
+		if (this.pendingSessionNames.has(reservationKey)) {
+			throw new Error(formatAgentSessionNameUnavailable(options.sessionName, options.rlmDepth));
+		}
+		this.pendingSessionNames.add(reservationKey);
+		try {
+			await this.assertFamilySessionNameAvailable(nameReservation, parentState, true);
+			return await this.admitRlmSubagentRuntime(parentState, options);
+		} finally {
+			this.pendingSessionNames.delete(reservationKey);
+		}
+	}
+
+	private async admitRlmSubagentRuntime(
 		parentState: ActiveSessionState,
 		options: CreateRlmSubagentRuntimeOptions,
 	): Promise<AgentSessionRuntime> {
@@ -3936,7 +3998,12 @@ export class AgentDaemon {
 				if (this.updateRestart && !updateLifecycle) {
 					this.write(
 						client,
-						failure(workerCommand.id, workerCommand.type, "Daemon is preparing an update restart"),
+						failure(
+							workerCommand.id,
+							workerCommand.type,
+							UPDATE_RESTART_PREPARING_MESSAGE,
+							UPDATE_RESTART_PREPARING_ERROR_INFO,
+						),
 					);
 					return;
 				}
@@ -3972,7 +4039,10 @@ export class AgentDaemon {
 				: restartPhase !== undefined && command.type !== "shutdown";
 		if (mutation && restartRejected) {
 			clearParsedAdmission();
-			this.write(client, failure(command.id, command.type, "Daemon is preparing an update restart"));
+			this.write(
+				client,
+				failure(command.id, command.type, UPDATE_RESTART_PREPARING_MESSAGE, UPDATE_RESTART_PREPARING_ERROR_INFO),
+			);
 			return;
 		}
 		if (mutation) this.mutationDrain.begin();
@@ -4726,6 +4796,12 @@ export class AgentDaemon {
 				const state = this.getSessionState(command.activeSessionId);
 				state.runtime.session.requestAbort();
 				return success(command.id, "abort");
+			}
+
+			case "abort_and_send_queued": {
+				const state = this.getSessionState(command.activeSessionId);
+				state.runtime.session.abortAndSendQueued();
+				return success(command.id, "abort_and_send_queued");
 			}
 
 			case "start_side_question": {
@@ -7287,10 +7363,23 @@ export class AgentDaemon {
 	private flushRoster(): void {
 		const reporter = this.rosterReporter;
 		const entries = new Map<string, WorkerRosterEntry>();
+		// Summary objects are memoized per session: an unchanged session composes
+		// to the same summary reference, so its roster entry and serialization can
+		// be reused instead of re-composed and re-stringified on every flush.
+		const composedSources = new Map<string, SessionSummary>();
 		const scheduledJobs = this.cronStore.list();
 		for (const summary of buildSessionList([...this.sessions.values()], [], scheduledJobs)) {
-			const entry = workerRosterEntryFromSummary(summary);
-			entries.set(entry.agentId, entry);
+			const agentId = rosterAgentIdForSummary(summary);
+			if (reporter.lastComposedSource.get(agentId) === summary) {
+				const entry = reporter.lastComposed.get(agentId);
+				if (entry) {
+					entries.set(agentId, entry);
+					composedSources.set(agentId, summary);
+					continue;
+				}
+			}
+			entries.set(agentId, workerRosterEntryFromSummary(summary));
+			composedSources.set(agentId, summary);
 		}
 		for (const [agentId, queued] of reporter.queuedChildren) {
 			if (entries.has(agentId)) {
@@ -7343,12 +7432,18 @@ export class AgentDaemon {
 		const changed: WorkerRosterEntry[] = [];
 		const nextJson = new Map<string, string>();
 		for (const entry of entries.values()) {
-			const json = JSON.stringify(entry);
+			// An entry reused from the last flush is unchanged by construction:
+			// skip its serialization and keep the previous json for the delta compare.
+			const json =
+				reporter.lastComposed.get(entry.agentId) === entry
+					? (reporter.lastComposedJson.get(entry.agentId) ?? JSON.stringify(entry))
+					: JSON.stringify(entry);
 			nextJson.set(entry.agentId, json);
 			if (reporter.lastComposedJson.get(entry.agentId) !== json) changed.push(entry);
 		}
 		const removedAgentIds = [...reporter.removedAgentIds.keys()];
 		reporter.lastComposed = new Map(entries);
+		reporter.lastComposedSource = composedSources;
 		reporter.lastComposedJson = nextJson;
 		if (!this.hasAuthenticatedSupervisorClient()) {
 			if (changed.length > 0 || removedAgentIds.length > 0) reporter.snapshotPending = true;
@@ -7794,10 +7889,7 @@ export class AgentDaemon {
 		this.peerAdmissionsFenced = true;
 		this.peerGrants.clear();
 		this.supervisorLinkInstance?.close();
-		if (this.supervisorMonitorTimer) {
-			clearTimeout(this.supervisorMonitorTimer);
-			this.supervisorMonitorTimer = undefined;
-		}
+		this.cancelArmedSupervisorAvailabilityCheck();
 		if (this.supervisorFenceTimer) {
 			clearTimeout(this.supervisorFenceTimer);
 			this.supervisorFenceTimer = undefined;
@@ -7839,6 +7931,8 @@ export class AgentDaemon {
 
 interface WorkerRosterReporterState {
 	lastComposed: Map<string, WorkerRosterEntry>;
+	/** Summary each lastComposed entry was composed from; an unchanged session reuses its entry. */
+	lastComposedSource: Map<string, SessionSummary>;
 	lastComposedJson: Map<string, string>;
 	queuedChildren: Map<string, WorkerRosterEntry>;
 	/** Pending removals: agentId -> removed sessionId; a new incarnation of the id cancels it. */
