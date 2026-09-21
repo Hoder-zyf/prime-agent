@@ -571,6 +571,33 @@ function withoutSupervisorCreateFields(command: DaemonCreateCommand): DaemonCrea
 	return workerCommand;
 }
 
+/**
+ * The worker uses command.config.cwd as an explicit override of a saved
+ * session's header. Merging defaults must not turn an omitted cwd into one.
+ * Keep the OS process cwd separate: it is a launch/relative-path base, not
+ * the restored session cwd used by resources, tools, and the Python kernel.
+ * Recovery commands use this same path and intentionally omit session config.
+ */
+function prepareWorkerLaunch(
+	defaultConfig: AgentSessionRuntimeConfig,
+	command: DaemonCreateCommand,
+): { createCommand: DaemonCreateCommand; processCwd: string } {
+	const config = mergeAgentSessionRuntimeConfig(defaultConfig, command.config);
+	const processCwd = config.cwd ?? process.cwd();
+	if (command.sessionPath && command.config?.cwd === undefined) {
+		// The worker reads the header and reports a missing directory normally.
+		// Only the caller can opt into a different cwd, including a fallback.
+		delete config.cwd;
+	}
+	return {
+		createCommand: {
+			...withoutSupervisorCreateFields(command),
+			config,
+		},
+		processCwd,
+	};
+}
+
 function responseWithId(response: DaemonResponse, id: string | undefined): DaemonResponse {
 	return { ...response, id };
 }
@@ -3297,10 +3324,7 @@ export class DaemonSupervisor {
 		}
 		const recoveryStopRevision = existing?.stopRevision;
 		const launchEnv = command.launchEnv ?? existing?.launchEnv;
-		const createCommand: DaemonCreateCommand = {
-			...withoutSupervisorCreateFields(command),
-			config: mergeAgentSessionRuntimeConfig(this.defaultSessionConfig, command.config),
-		};
+		const { createCommand, processCwd } = prepareWorkerLaunch(this.defaultSessionConfig, command);
 		const workerId = existing?.descriptor.workerId ?? createActiveSessionId();
 		const rootActiveSessionId = existing?.descriptor.rootActiveSessionId ?? createActiveSessionId();
 		const socketPath = existing?.descriptor.socketPath ?? workerSocketPath(this.socketPath, workerId);
@@ -3331,7 +3355,7 @@ export class DaemonSupervisor {
 		delete workerEnvironment.RLM_DEPTH;
 		await this.assertRecoveryAllowed();
 		const child: ChildProcess = spawnHidden(launch.command, launch.args, {
-			cwd: createCommand.config?.cwd ?? process.cwd(),
+			cwd: processCwd,
 			detached: true,
 			env: workerEnvironment,
 			stdio: ["ignore", "ignore", "pipe", "pipe"],

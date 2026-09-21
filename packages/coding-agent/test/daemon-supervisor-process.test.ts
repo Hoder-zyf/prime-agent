@@ -217,7 +217,8 @@ async function connectEventually(socketPath: string, child?: ChildProcess): Prom
 			await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
 		}
 	}
-	throw new Error(`Timed out waiting for supervisor: ${String(lastError)}`);
+	const diagnostics = child ? childDiagnostics.get(child) : undefined;
+	throw new Error(`Timed out waiting for supervisor: ${String(lastError)}\n${diagnostics?.stderr ?? ""}`);
 }
 
 async function waitForSocketGone(socketPath: string): Promise<void> {
@@ -326,34 +327,43 @@ describe("daemon supervisor resident workers", () => {
 		await waitForSocketGone(socketPath);
 	}, 60_000);
 
-	it("creates top-level sessions at depth zero when the supervisor inherits a child depth", async () => {
+	it.each(["new", "resume", "override", "missing"])("#2454 preserves top-level cwd/depth: %s", async (kind) => {
 		const root = tempDir();
 		const agentDir = join(root, "agent");
 		const projectDir = join(root, "project");
 		const sessionDir = join(agentDir, "sessions");
 		const socketPath = join(tmpdir(), `prime-supervisor-depth-${process.pid}-${randomUUID().slice(0, 8)}.sock`);
 		mkdirSync(projectDir, { recursive: true });
-
+		const manager = SessionManager.create(kind === "missing" ? join(root, "gone") : root, sessionDir);
+		manager.flushNow();
+		const cwd = kind === "new" || kind === "override" ? projectDir : undefined;
 		const supervisor = spawnSupervisor(agentDir, socketPath, projectDir, [], { RLM_DEPTH: "1" });
 		const client = await connectEventually(socketPath, supervisor);
-		const created = await client.request({
-			type: "create",
-			config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
-		});
-		if (!created.success) throw new Error(created.error);
-		const summary = requireSummary(created.data);
-		if (!summary.workerPid || !summary.sessionFile) throw new Error("Worker did not expose its session identity");
-		workerPids.add(summary.workerPid);
-
-		expect(summary).toMatchObject({ runtimeKind: "top-level", rlmDepth: 0 });
-		expect(await readSessionInfo(summary.sessionFile)).toMatchObject({ rlmDepth: 0, parentSessionPath: undefined });
-
-		await client.request({ type: "shutdown" });
-		client.close();
-		await waitForProcessGone(summary.workerPid);
-		workerPids.delete(summary.workerPid);
-		await waitForSocketGone(socketPath);
-	}, 60_000);
+		try {
+			const created = await client.request({
+				type: "create",
+				sessionPath: kind === "new" ? undefined : manager.getSessionFile(),
+				config: { cwd, agentDir, sessionDir, noTools: true, noExtensions: true },
+			});
+			if (kind === "missing") {
+				expect(created).toMatchObject({ success: false, errorInfo: { code: "missing_session_cwd" } });
+			} else {
+				if (!created.success) throw new Error(created.error);
+				const summary = requireSummary(created.data);
+				if (!summary.workerPid || !summary.sessionFile) throw new Error("Missing worker identity");
+				workerPids.add(summary.workerPid);
+				expect(summary).toMatchObject({ cwd: cwd ?? root, runtimeKind: "top-level", rlmDepth: 0 });
+				expect(await readSessionInfo(summary.sessionFile)).toMatchObject({
+					rlmDepth: 0,
+					parentSessionPath: undefined,
+				});
+			}
+		} finally {
+			await client.request({ type: "shutdown" });
+			client.close();
+			await waitForExit(supervisor);
+		}
+	});
 
 	it("restarts an adopted pre-roster worker from the current binary", async () => {
 		const directory = tempDir();

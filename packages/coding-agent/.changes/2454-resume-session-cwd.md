@@ -1,0 +1,2 @@
+- Fixed saved sessions reopening in the background service’s directory instead of their recorded project directory, while preserving explicit working-directory overrides.
+- Added a maintained-fork upgrade workflow that merges upstream releases into isolated, validated candidates without changing running agents.

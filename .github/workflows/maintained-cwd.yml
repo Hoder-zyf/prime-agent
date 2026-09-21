@@ -1,0 +1,76 @@
+name: Maintained cwd
+
+on:
+  push:
+    branches: [fix/update]
+  workflow_dispatch:
+
+concurrency:
+  group: maintained-cwd-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate maintained cwd branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install npm with dependency age-policy support
+        run: |
+          npm install --global --ignore-scripts npm@11.10.0
+          npm --version
+
+      - name: Install locked dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Check and test without user state or provider credentials
+        shell: bash
+        run: |
+          umask 077
+          test_root="$(mktemp -d "$RUNNER_TEMP/cwd.XXXXXX")"
+          mkdir -p "$test_root"/{home,config,cache,data,state,runtime,agent,tmp}
+          # A clean environment also removes any inherited PRIME_AGENT_SESSION_DIR.
+          env -i \
+            PATH="$PATH" \
+            HOME="$test_root/home" \
+            XDG_CONFIG_HOME="$test_root/config" \
+            XDG_CACHE_HOME="$test_root/cache" \
+            XDG_DATA_HOME="$test_root/data" \
+            XDG_STATE_HOME="$test_root/state" \
+            XDG_RUNTIME_DIR="$test_root/runtime" \
+            PRIME_AGENT_CODING_AGENT_DIR="$test_root/agent" \
+            TMPDIR="$test_root/tmp" TMP="$test_root/tmp" TEMP="$test_root/tmp" \
+            RUNNER_TEMP="$test_root" \
+            GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+            TEST_POLICY_BASE=HEAD^ CI=true DO_NOT_TRACK=1 PI_OFFLINE=1 \
+            bash --noprofile --norc -euo pipefail -c '
+              git rev-parse --verify HEAD^ >/dev/null
+              npm run check
+              git diff --exit-code HEAD --
+              node --test scripts/test-update-cwd-fork.mjs
+              cd packages/coding-agent
+              node ../../node_modules/tsx/dist/cli.mjs ../../node_modules/vitest/dist/cli.js --run \
+                test/daemon-supervisor-process.test.ts test/session-cwd.test.ts \
+                test/agents-view-state.test.ts test/daemon-mode.test.ts \
+                --maxWorkers=1 --bail=1 --sequence.shuffle --sequence.seed=17
+              node ../../node_modules/tsx/dist/cli.mjs ../../node_modules/vitest/dist/cli.js --run \
+                test/daemon-supervisor-process.test.ts test/session-cwd.test.ts \
+                test/agents-view-state.test.ts test/daemon-mode.test.ts \
+                --maxWorkers=1 --bail=1 --sequence.shuffle --sequence.seed=29
+              git diff --exit-code HEAD --
+            '
