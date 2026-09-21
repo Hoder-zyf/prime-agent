@@ -41,6 +41,13 @@ Prime Agent is an open-source coding and research agent for general and long-run
 - The **[Recursive Language Model (RLM)](https://www.primeintellect.ai/blog/rlm)** treats context as variables (*prompt-as-a-variable*) and tools like recursive subagents as function calls (*programmatic tool /sub-agent calling*) inside a persistent REPL.
 - The **[Continual Harness](https://arxiv.org/abs/2605.09998)** stores supplemental prompts, memories, skill descriptions, and reusable subagent specifications as durable state that Prime Agent can refine through small, evidence-backed updates, local to the session by default.
 
+## 维护版版本更新（fix/update）
+
+使用本分支，请先看 **[版本更新手册（中文）](UPDATE_GUIDE.zh-CN.md)**。
+手册按“首次从官方版切换、以后升级、失败回退”给出操作步骤。
+官方 `prime-agent update` 不会保留本分支修复；准备和测试新版也不会自动切换正在运行的 daemon。
+以下安装说明面向官方发行版，不是维护版的升级入口。
+
 ## Install
 
 Install the latest stable release on macOS or Linux:

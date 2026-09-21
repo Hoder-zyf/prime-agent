@@ -1,5 +1,7 @@
 # Maintained cwd fork upgrades
 
+For step-by-step operator instructions, see [版本更新手册（中文）](../../../UPDATE_GUIDE.zh-CN.md).
+
 `Hoder-zyf/prime-agent`, branch `fix/update`, maintains the session working-directory fixes as source commits. Upgrade by merging a selected upstream release into those commits, then validate an independent candidate. This is not a binary patch or a version-specific fingerprint replacement.
 
 Use this path until the fixes are merged and included in an official release. `prime-agent update` and `/update` follow official release channels; they do not maintain this fork's commits. Future upstream changes can cause merge conflicts or new failures. A successful merge is not a compatibility guarantee.
