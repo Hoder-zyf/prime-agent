@@ -105,7 +105,7 @@ export function validateCandidate({ candidate, candidateSha, env }) {
 		[npm, ["run", "check:test-policy"], candidate],
 		[process.execPath, [join(candidate, "node_modules/tsx/dist/cli.mjs"),
 			join(candidate, "node_modules/vitest/dist/cli.js"), "--run", "--no-file-parallelism",
-			"--maxWorkers=1", "--minWorkers=1", "--bail=1", ...cwdTests.map((name) => `test/${name}.test.ts`)],
+			"--maxWorkers=1", "--bail=1", ...cwdTests.map((name) => `test/${name}.test.ts`)],
 			join(candidate, "packages/coding-agent")],
 		[process.execPath, ["--test", "--test-concurrency=1", "scripts/test-update-cwd-fork.mjs"], candidate],
 	];
