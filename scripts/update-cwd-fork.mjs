@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 export const OFFICIAL_UPSTREAM = "https://github.com/PrimeIntellect-ai/prime-agent.git";
 export const RECEIPT_PATH = ".git/cwd-update/receipt.json";
 const branch = "fix/update";
-const cwdTests = ["daemon-supervisor-process", "session-cwd", "agents-view-state", "daemon-mode"];
+const cwdTests = ["daemon-supervisor-process", "session-cwd", "agents-view-state", "daemon-mode", "stdout-cleanliness"];
 
 function baseEnvironment() {
 	const env = {};

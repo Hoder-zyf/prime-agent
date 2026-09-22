@@ -78,4 +78,6 @@ if [[ ! -x "$TSX_BIN" ]]; then
   exit 1
 fi
 
+# Resolve workspace source aliases from this checkout without changing the caller's cwd.
+export TSX_TSCONFIG_PATH="$SCRIPT_DIR/tsconfig.json"
 "$TSX_BIN" "$SCRIPT_DIR/packages/coding-agent/src/cli.ts" ${ARGS[@]+"${ARGS[@]}"}

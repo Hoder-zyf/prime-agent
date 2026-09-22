@@ -1,0 +1,1 @@
+- Fixed source launcher startup from other project directories without changing the project working directory.

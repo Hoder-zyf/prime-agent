@@ -66,11 +66,11 @@ jobs:
               cd packages/coding-agent
               node ../../node_modules/tsx/dist/cli.mjs ../../node_modules/vitest/dist/cli.js --run \
                 test/daemon-supervisor-process.test.ts test/session-cwd.test.ts \
-                test/agents-view-state.test.ts test/daemon-mode.test.ts \
+                test/agents-view-state.test.ts test/daemon-mode.test.ts test/stdout-cleanliness.test.ts \
                 --maxWorkers=1 --bail=1 --sequence.shuffle --sequence.seed=17
               node ../../node_modules/tsx/dist/cli.mjs ../../node_modules/vitest/dist/cli.js --run \
                 test/daemon-supervisor-process.test.ts test/session-cwd.test.ts \
-                test/agents-view-state.test.ts test/daemon-mode.test.ts \
+                test/agents-view-state.test.ts test/daemon-mode.test.ts test/stdout-cleanliness.test.ts \
                 --maxWorkers=1 --bail=1 --sequence.shuffle --sequence.seed=29
               git diff --exit-code HEAD --
             '

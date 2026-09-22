@@ -49,7 +49,7 @@ The default upstream URL is `https://github.com/PrimeIntellect-ai/prime-agent.gi
 
 The tool clones the exact committed source head into an independent destination and uses Git merge to retain the maintained commits while incorporating the selected upstream ref. Candidate `origin` retains the source checkout's fork remote; the upstream source is separate. It does not push, publish, create a pull request, replace a launcher, or stop a daemon.
 
-Validation checks the npm version, installs the locked dependencies with `npm ci --ignore-scripts`, runs `npm run check` and `npm run check:test-policy`, then runs the focused cwd tests and the standard-library upgrade-tool tests. The candidate test-policy base is the fetched upstream commit. A formatter change is not silently accepted as a passing validation: the tracked tree must stay clean after each step. Test state is isolated from the user's configuration and sessions. Tests do not need provider credentials.
+Validation checks the npm version, installs the locked dependencies with `npm ci --ignore-scripts`, runs `npm run check` and `npm run check:test-policy`, then runs the focused cwd and source-launcher tests and the standard-library upgrade-tool tests. The candidate test-policy base is the fetched upstream commit. A formatter change is not silently accepted as a passing validation: the tracked tree must stay clean after each step. Test state is isolated from the user's configuration and sessions. Tests do not need provider credentials.
 
 The selected commits are recorded in `.git/cwd-update/inputs.json`. Only a fully successful run writes `.git/cwd-update/receipt.json`. Inspect that receipt and the validation output before approving the candidate. A failed run does not produce a success receipt.
 
@@ -82,16 +82,20 @@ CI uses Node.js 22 and pinned npm 11.10.0. It fetches full history so the test-p
 
 - `npm run check`, including `check:test-policy`, followed by a tracked clean-tree check.
 - `node --test scripts/test-update-cwd-fork.mjs` for the standard-library upgrade-tool tests.
-- The four focused test files below with one worker and two fixed shuffle seeds. The first failure stops validation; these are not retry-to-green runs.
+- The five focused test files below with one worker and two fixed shuffle seeds. The first failure stops validation; these are not retry-to-green runs.
 
 The source-native test command runs from `packages/coding-agent`:
 
 ```sh
 node ../../node_modules/tsx/dist/cli.mjs ../../node_modules/vitest/dist/cli.js --run \
   test/daemon-supervisor-process.test.ts test/session-cwd.test.ts \
-  test/agents-view-state.test.ts test/daemon-mode.test.ts \
+  test/agents-view-state.test.ts test/daemon-mode.test.ts test/stdout-cleanliness.test.ts \
   --maxWorkers=1 --bail=1
 ```
+
+The source shell launcher pins `TSX_TSCONFIG_PATH` to its own checkout and preserves the caller's cwd. The source-launcher tests use private projects outside the checkout, including a path with spaces, with conflicting local or inherited tsconfig settings. They check the real CLI's imports, argument forwarding, stdout behavior, and process cwd; they do not verify interactive chat or real-session migration.
+
+CLI/daemon compatibility uses build identity, not just the displayed version. Decline any prompt to replace a busy daemon. A new chat can reuse the matching runtime; it does not require stopping it. For an unchanged older source runtime without this launcher fix, explicitly set `TSX_TSCONFIG_PATH` to that runtime's tsconfig when invoking its matching launcher. Do not edit or build into live source to remove this workaround.
 
 Use the workflow's isolation when reproducing this command. CI creates owner-private directories under a unique `RUNNER_TEMP` path and starts validation with a clean environment. `HOME`, the XDG directories, `PRIME_AGENT_CODING_AGENT_DIR`, and temporary-file paths are private. It does not inherit provider credentials or set a shared `PRIME_AGENT_SESSION_DIR`. Daemon state is not uploaded as a CI artifact.
 
