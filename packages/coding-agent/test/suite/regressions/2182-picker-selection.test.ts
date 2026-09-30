@@ -22,7 +22,7 @@ function deferred() {
 	});
 	return { promise, resolve };
 }
-async function fixture() {
+async function fixture(scoped = false) {
 	const harness = await createHarness({
 		models: [
 			{ id: "plain", name: "Plain", reasoning: false },
@@ -51,8 +51,8 @@ async function fixture() {
 		connectionConfiguredProviders: new Set([model.provider]),
 		connectionState: { thinkingLevel: "off" },
 		getCurrentModel: () => plain,
-		getScopedModelState: () => [],
-		getCachedModelCandidates: () => [model],
+		getScopedModelState: () => (scoped ? [{ model }] : []),
+		getCachedModelCandidates: () => (scoped ? [model, plain] : [model]),
 		getModelSelectorRefreshPromise: () => undefined,
 		createAuthFlows: () => ({ getLoginProviderOptions: () => [] }),
 		ensureModelProviderConfigured: async () => true,
@@ -176,6 +176,40 @@ it.each([false, true])("edits search text with arrows for reasoning=%s", async (
 		selector.handleInput("\x1b[D");
 		expect(cancel).toHaveBeenCalledTimes(2);
 	}
+});
+
+it("toggles model scope instead of typing when Option+S arrives as the composed ß (macOS)", async () => {
+	const f = await fixture(true);
+	const done = f.mode.showConfigurationMenu("models");
+	f.menu().handleInput("ß");
+	expect(stripAnsi(f.menu().render(100).join("\n"))).toContain("Plain");
+	f.menu().handleInput("\x1b");
+	await done;
+});
+
+it("refreshes a fresh model catalog when the picker opens without a search", async () => {
+	const f = await fixture();
+	const plain = f.harness.getModel("plain")!;
+	const getModelCatalog = vi.fn(async () => ({ models: [f.model, plain], configuredProviders: [plain.provider] }));
+	const prototype = InteractiveMode.prototype as unknown as Record<string, (...args: unknown[]) => unknown>;
+	const refresh = vi.fn(prototype.getModelSelectorRefreshPromise);
+	Object.assign(f.mode, {
+		agentConnection: { getModelCatalog },
+		connectionModelCatalog: [f.model],
+		connectionModelsFetchedAt: Date.now(),
+		connectionModelsRefreshVersion: 0,
+		getCurrentModel: () => f.model,
+		getCachedModelCandidates: prototype.getCachedModelCandidates,
+		getModelSelectorRefreshPromise: refresh,
+	});
+	const done = f.mode.showConfigurationMenu("models");
+	const listed = () => stripAnsi(f.menu().render(100).join("\n"));
+	expect(listed()).not.toContain("Plain");
+	expect(getModelCatalog).toHaveBeenCalledOnce();
+	await refresh.mock.results[0]?.value;
+	expect(listed()).toContain("Plain");
+	f.menu().handleInput("\x1b");
+	await done;
 });
 
 it("does not publish the removed configuration tab action", () => {
