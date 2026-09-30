@@ -664,6 +664,13 @@ export class AgentDaemon {
 			onError: (job, error) => {
 				this.log(`Cron job ${job.id} failed: ${error instanceof Error ? error.message : String(error)}`);
 			},
+			onSchedulerError: (error) => {
+				const details = error as { code?: unknown; file?: unknown } | null | undefined;
+				const code = typeof details?.code === "string" ? details.code : undefined;
+				const file = typeof details?.file === "string" ? details.file : undefined;
+				const stack = error instanceof Error ? (error.stack ?? error.message) : String(error);
+				this.log(`Cron scheduler failed: ${JSON.stringify({ code, file, stack })}`);
+			},
 		});
 		this.cronStore.onHeartbeatChange(() => {
 			this.broadcastGlobal({ type: "heartbeats_changed" });

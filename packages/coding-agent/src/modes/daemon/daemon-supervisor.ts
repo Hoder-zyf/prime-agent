@@ -598,16 +598,36 @@ function withoutSupervisorCreateFields(command: DaemonCreateCommand): DaemonCrea
  * the restored session cwd used by resources, tools, and the Python kernel.
  * Recovery commands use this same path and intentionally omit session config.
  */
-function prepareWorkerLaunch(
+/**
+ * A saved session owns its working directory. Resolve it from the header so the
+ * supervisor can use it as the worker's launch cwd too, not only as the absent
+ * config cwd. Returns undefined when the header has no cwd or that directory is
+ * gone, in which case the existing controlled error / caller fallback applies.
+ */
+async function getExistingSessionCwd(sessionPath: string | undefined): Promise<string | undefined> {
+	if (!sessionPath) return undefined;
+	const info = await readSessionInfo(sessionPath).catch(() => null);
+	if (!info?.cwd || !existsSync(info.cwd)) return undefined;
+	return resolve(info.cwd);
+}
+
+async function prepareWorkerLaunch(
 	defaultConfig: AgentSessionRuntimeConfig,
 	command: DaemonCreateCommand,
-): { createCommand: DaemonCreateCommand; processCwd: string } {
+): Promise<{ createCommand: DaemonCreateCommand; processCwd: string }> {
 	const config = mergeAgentSessionRuntimeConfig(defaultConfig, command.config);
-	const processCwd = config.cwd ?? process.cwd();
+	let processCwd = config.cwd ?? process.cwd();
 	if (command.sessionPath && command.config?.cwd === undefined) {
 		// The worker reads the header and reports a missing directory normally.
 		// Only the caller can opt into a different cwd, including a fallback.
 		delete config.cwd;
+		// Deleting the merged cwd is not enough on its own: the worker's own launch
+		// directory is a second way for a default to reach the session, and clients
+		// that open a saved session without an explicit cwd (the agents view) hit it.
+		// Pin the launch directory to the stored header cwd so the header wins on
+		// every path, not just the plain create path.
+		const storedCwd = await getExistingSessionCwd(command.sessionPath);
+		if (storedCwd) processCwd = storedCwd;
 	}
 	return {
 		createCommand: {
@@ -3502,7 +3522,7 @@ export class DaemonSupervisor {
 		}
 		const recoveryStopRevision = existing?.stopRevision;
 		const launchEnv = command.launchEnv ?? existing?.launchEnv;
-		const { createCommand, processCwd } = prepareWorkerLaunch(this.defaultSessionConfig, command);
+		const { createCommand, processCwd } = await prepareWorkerLaunch(this.defaultSessionConfig, command);
 		const workerId = existing?.descriptor.workerId ?? createActiveSessionId();
 		const rootActiveSessionId = existing?.descriptor.rootActiveSessionId ?? createActiveSessionId();
 		const socketPath = existing?.descriptor.socketPath ?? workerSocketPath(this.socketPath, workerId);

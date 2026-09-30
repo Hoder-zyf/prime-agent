@@ -73,6 +73,8 @@ export interface AgentCronSchedulerHooks {
 	beginDispatch?: (dispatch: AgentCronDispatch) => (() => void) | undefined;
 	now?: () => Date;
 	onError?: (job: AgentCronJob, error: unknown) => void;
+	/** Failures in recovery, claiming, or persisting dispatch results (not a job failure). */
+	onSchedulerError?: (error: unknown) => void;
 }
 
 export interface HeartbeatCronSessionActivity {
@@ -196,6 +198,8 @@ export class AgentCronJobStore {
 	private readonly heartbeatChangeListeners = new Set<() => void>();
 	/** Parsed-state snapshot per jobs file, keyed by path; the stat identity decides when a snapshot is still current. */
 	private readonly stateSnapshots = new Map<string, CronJobsStateSnapshot>();
+	/** Serialize local writers before they acquire the cross-process file locks. */
+	private writeQueue: Promise<void> = Promise.resolve();
 
 	constructor(
 		private readonly filePath?: string,
@@ -228,18 +232,20 @@ export class AgentCronJobStore {
 	}
 
 	async recoverSessionArtifact(sessionId: string, now = new Date()): Promise<AgentCronJob[]> {
-		const path = this.sessionArtifactFiles.get(sessionId);
-		if (!path) {
-			return [];
-		}
-		return withCronJobsStateLocks([path], () => {
-			const state = roundTripJobsState(this.readState(path));
-			const recovered: AgentCronJob[] = [];
-			if (state.dispatches.length > 0) {
-				recoverInterruptedInState(state, now, recovered);
-				this.writeState(path, state);
+		return this.enqueueWrite(async () => {
+			const path = this.sessionArtifactFiles.get(sessionId);
+			if (!path) {
+				return [];
 			}
-			return recovered;
+			return withCronJobsStateLocks([path], () => {
+				const state = roundTripJobsState(this.readState(path));
+				const recovered: AgentCronJob[] = [];
+				if (state.dispatches.length > 0) {
+					recoverInterruptedInState(state, now, recovered);
+					this.writeState(path, state);
+				}
+				return recovered;
+			});
 		});
 	}
 
@@ -851,6 +857,12 @@ export class AgentCronJobStore {
 	private async mutateStates<T>(
 		mutator: (state: CronJobsState) => CronJobsStateMutation<T>,
 	): Promise<CronJobsStateMutation<T>> {
+		return this.enqueueWrite(() => this.mutateStatesSerial(mutator));
+	}
+
+	private async mutateStatesSerial<T>(
+		mutator: (state: CronJobsState) => CronJobsStateMutation<T>,
+	): Promise<CronJobsStateMutation<T>> {
 		const paths = this.sessionArtifactMode ? [...this.sessionArtifactFiles.values()] : [this.requireFilePath()];
 		const previousHeartbeats = heartbeatCatalogSignature(this.readJobs());
 		const changedPaths: string[] = [];
@@ -896,6 +908,12 @@ export class AgentCronJobStore {
 	 * return value; only the locked pass's result is returned.
 	 */
 	private async writeJobs<T>(
+		mutate: (current: readonly AgentCronJob[]) => { jobs: readonly AgentCronJob[]; result: T },
+	): Promise<T> {
+		return this.enqueueWrite(() => this.writeJobsSerial(mutate));
+	}
+
+	private async writeJobsSerial<T>(
 		mutate: (current: readonly AgentCronJob[]) => { jobs: readonly AgentCronJob[]; result: T },
 	): Promise<T> {
 		const previousHeartbeats = heartbeatCatalogSignature(this.readJobs());
@@ -947,6 +965,17 @@ export class AgentCronJobStore {
 		if (heartbeatCatalogSignature(this.readJobs()) !== previousHeartbeats) {
 			this.notifyHeartbeatChange();
 		}
+		return result;
+	}
+
+	/** Only the write-side entry points enqueue; their implementations must not enqueue again. */
+	private enqueueWrite<T>(action: () => Promise<T>): Promise<T> {
+		const result = this.writeQueue.then(action);
+		// A failed write still rejects its caller, but must not poison subsequent writes.
+		this.writeQueue = result.then(
+			() => undefined,
+			() => undefined,
+		);
 		return result;
 	}
 
@@ -1007,8 +1036,16 @@ export class AgentCronScheduler {
 	private stopped = true;
 	private hasStarted = false;
 	private readonly dispatchLanes = new Map<string, Promise<void>>();
+	/** Finished jobs whose exact result still needs to reach disk; never replay their runJob call. */
+	private readonly pendingDispatchResults = new Map<
+		string,
+		Parameters<AgentCronJobStore["recordDispatchResult"]>[1]
+	>();
 	/** Set once startup recovery landed; a failed recovery is retried by the next claim instead of being skipped. */
 	private recovered = false;
+	private consecutiveSchedulerFailures = 0;
+	private schedulerFailureGeneration = 0;
+	private schedulerRetryNotBefore = 0;
 
 	constructor(
 		private readonly store: AgentCronJobStore,
@@ -1019,7 +1056,7 @@ export class AgentCronScheduler {
 		this.stopped = false;
 		this.hasStarted = true;
 		// A stale dispatch record would make claimDue skip a due job, so the first claim recovers first.
-		this.scheduleNext(this.recovered ? undefined : 0);
+		this.scheduleNext(!this.recovered || this.pendingDispatchResults.size > 0 ? 0 : undefined);
 	}
 
 	stop(): void {
@@ -1042,6 +1079,7 @@ export class AgentCronScheduler {
 			return 0;
 		}
 		this.running = true;
+		const failureGeneration = this.schedulerFailureGeneration;
 		const dispatches: Array<{ dispatch: AgentCronDispatch; endDispatch?: () => void }> = [];
 		let claimedDispatches: AgentCronDispatch[] | undefined;
 		try {
@@ -1050,6 +1088,14 @@ export class AgentCronScheduler {
 				this.recovered = true;
 				if (this.stopped) return 0;
 			}
+			for (const [dispatchId, result] of this.pendingDispatchResults) {
+				if (this.stopped && this.hasStarted) return 0;
+				await this.store.recordDispatchResult(dispatchId, result);
+				if (this.pendingDispatchResults.get(dispatchId) === result) {
+					this.pendingDispatchResults.delete(dispatchId);
+				}
+			}
+			if (this.stopped && this.hasStarted) return 0;
 			claimedDispatches = await this.store.claimDue(now, this.now());
 			for (const dispatch of claimedDispatches) {
 				dispatches.push({ dispatch, endDispatch: this.hooks.beginDispatch?.(dispatch) });
@@ -1072,6 +1118,11 @@ export class AgentCronScheduler {
 		const results = await Promise.all(
 			dispatches.map(({ dispatch, endDispatch }) => this.queueDispatch(dispatch, endDispatch)),
 		);
+		// An older dispatch finishing must not erase a newer scheduling failure's cooldown.
+		if (this.schedulerFailureGeneration === failureGeneration) {
+			this.consecutiveSchedulerFailures = 0;
+			this.schedulerRetryNotBefore = 0;
+		}
 		return results.filter((result) => result !== "skipped").length;
 	}
 
@@ -1087,7 +1138,7 @@ export class AgentCronScheduler {
 				try {
 					const job = this.store.getClaimedJob(dispatch.job.id);
 					if (!job) {
-						await this.store.recordDispatchResult(dispatch.id, { now: this.now(), outcome: "skipped" });
+						await this.persistDispatchResult(dispatch.id, { now: this.now(), outcome: "skipped" });
 						return "skipped";
 					}
 					let runResult: AgentCronJobRunResult | undefined;
@@ -1098,7 +1149,7 @@ export class AgentCronScheduler {
 						error = runError;
 						this.hooks.onError?.(job, runError);
 					}
-					await this.store.recordDispatchResult(dispatch.id, {
+					await this.persistDispatchResult(dispatch.id, {
 						now: this.now(),
 						outcome: runResult === "skipped" && error === undefined ? "skipped" : "ran",
 						error,
@@ -1121,30 +1172,65 @@ export class AgentCronScheduler {
 		return task;
 	}
 
+	private async persistDispatchResult(
+		dispatchId: string,
+		result: Parameters<AgentCronJobStore["recordDispatchResult"]>[1],
+	): Promise<void> {
+		try {
+			await this.store.recordDispatchResult(dispatchId, result);
+		} catch (error) {
+			this.pendingDispatchResults.set(dispatchId, result);
+			// Promise.all reports only its first failure. A later failing lane must also
+			// leave a retry scheduled, even if that first failure has already recovered.
+			this.scheduleNext(1000);
+			throw error;
+		}
+	}
+
 	private scheduleNext(delayMs?: number): void {
+		if (this.stopped) {
+			return;
+		}
 		if (this.timer) {
 			clearTimeout(this.timer);
 			this.timer = undefined;
 		}
-		const now = this.now();
 		const nextDelay =
 			delayMs ??
 			(() => {
 				const next = this.store.nextActiveRunAt();
 				if (!next) {
-					return undefined;
+					return this.pendingDispatchResults.size > 0 ? 1000 : undefined;
 				}
-				return Math.max(0, next.getTime() - now.getTime());
+				const nextJobDelay = Math.max(0, next.getTime() - this.now().getTime());
+				return this.pendingDispatchResults.size > 0 ? Math.min(1000, nextJobDelay) : nextJobDelay;
 			})();
 		if (nextDelay === undefined) {
 			return;
 		}
 		this.timer = setTimeout(
 			() => {
-				void this.runDue();
+				this.timer = undefined;
+				// This is a detached entry point: direct callers of runDue still receive failures.
+				void this.runDue().catch((error) => this.handleSchedulerError(error));
 			},
-			Math.min(nextDelay, MAX_TIMEOUT_MS),
+			Math.min(Math.max(nextDelay, this.schedulerRetryNotBefore - Date.now()), MAX_TIMEOUT_MS),
 		);
+	}
+
+	private handleSchedulerError(error: unknown): void {
+		this.schedulerFailureGeneration++;
+		this.consecutiveSchedulerFailures++;
+		const delayMs = Math.min(1000 * 2 ** Math.min(this.consecutiveSchedulerFailures - 1, 5), 30_000);
+		this.schedulerRetryNotBefore = Date.now() + delayMs;
+		try {
+			// Also contain an accidentally async reporting hook, despite its void signature.
+			void Promise.resolve(this.hooks.onSchedulerError?.(error)).catch(() => undefined);
+		} catch {
+			// Diagnostics must not turn a recoverable scheduler failure into an unhandled rejection.
+		}
+		// Explicit delay also retries startup recovery when the catalog has no active jobs.
+		this.scheduleNext(delayMs);
 	}
 
 	private now(): Date {

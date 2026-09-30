@@ -1,0 +1,10 @@
+#!/bin/sh
+# Entry wrapper for this host root.
+#
+# The real launcher (../prime-agent.sh) resolves its own directory from BASH_SOURCE,
+# so it must be invoked by its real path: a symlink in a bin dir elsewhere would make
+# it look for node_modules next to the symlink. Resolve $0 through any symlink first,
+# then keep the user-facing entry a plain symlink to this file.
+SELF=$(readlink -f -- "$0") || exit 127
+HOST_DIR=$(CDPATH= cd -- "$(dirname -- "$SELF")/.." && pwd -P) || exit 127
+exec "$HOST_DIR/prime-agent.sh" "$@"
